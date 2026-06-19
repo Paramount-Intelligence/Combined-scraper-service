@@ -120,6 +120,7 @@ def main():
                 cwd=cwd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 check=True
             )
             print(f"✅ Finished {name} Scraper successfully.")
