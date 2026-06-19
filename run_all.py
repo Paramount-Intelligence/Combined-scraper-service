@@ -32,49 +32,62 @@ SCRAPERS = [
 
 SPREADSHEET_SCRIPT = "scrapers/spreadsheet_insert/insert_to_spreadsheet.py"
 
-def send_error_email(errors):
-    """Send an SMTP email notification detailing which scripts failed."""
+def send_status_email(errors):
+    """Send an SMTP email notification detailing execution status."""
     if not SENDER_EMAIL or not SENDER_PASSWORD:
-        print("⚠️ SMTP credentials not set. Cannot send error email alert.")
+        print("⚠️ SMTP credentials not set. Cannot send status email alert.")
         return
 
     try:
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"❌ Scraper Service Failures - {datetime.now().strftime('%Y-%m-%d')}"
+        
+        if errors:
+            msg["Subject"] = f"❌ Scraper Service Failures - {datetime.now().strftime('%Y-%m-%d')}"
+            header_color = "#d9534f"
+            header_text = "⚠️ Scraper Execution Failures"
+            intro_text = "The daily scraper service ran into errors. The following script(s) failed to complete successfully:"
+            
+            # Construct HTML Email table for errors
+            table_content = """
+            <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                <thead>
+                    <tr style="background-color: #f2dede; color: #a94442;">
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Script Name</th>
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Exit Code</th>
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Error Snippet</th>
+                    </tr>
+                </thead>
+                <tbody>
+            """
+            for name, code, error_log in errors:
+                snippet = error_log[-1000:] if len(error_log) > 1000 else error_log
+                table_content += f"""
+                    <tr>
+                        <td style="padding: 10px; border: 1px solid #ddd; font-weight: bold; vertical-align: top;">{name}</td>
+                        <td style="padding: 10px; border: 1px solid #ddd; color: #d9534f; vertical-align: top;">{code}</td>
+                        <td style="padding: 10px; border: 1px solid #ddd; background-color: #fdf5f5; font-family: monospace; white-space: pre-wrap; font-size: 12px; vertical-align: top;">{snippet}</td>
+                    </tr>
+                """
+            table_content += "</tbody></table>"
+        else:
+            msg["Subject"] = f"✅ Scraper Service Success - {datetime.now().strftime('%Y-%m-%d')}"
+            header_color = "#5cb85c"
+            header_text = "🎉 Scraper Execution Success"
+            intro_text = "The daily scraper service finished successfully. All 6 scrapers and the spreadsheet insertion script ran without any errors."
+            table_content = ""
+
         msg["From"] = SENDER_EMAIL
         msg["To"] = ERROR_RECIPIENT
 
-        # Construct HTML Email body
         html_body = f"""
         <html>
         <body style="font-family: Arial, sans-serif; color: #333; line-height: 1.6;">
-            <div style="max-width: 800px; margin: 20px auto; padding: 20px; border: 1px solid #ecc; border-radius: 8px; background-color: #fffaf0;">
-                <h2 style="color: #d9534f; border-bottom: 2px solid #d9534f; padding-bottom: 10px;">⚠️ Scraper Execution Failures</h2>
-                <p>The daily scraper service ran into errors. The following script(s) failed to complete successfully:</p>
-                <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
-                    <thead>
-                        <tr style="background-color: #f2dede; color: #a94442;">
-                            <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Script Name</th>
-                            <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Exit Code</th>
-                            <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Error Snippet</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-        """
-        for name, code, error_log in errors:
-            snippet = error_log[-1000:] if len(error_log) > 1000 else error_log
-            html_body += f"""
-                        <tr>
-                            <td style="padding: 10px; border: 1px solid #ddd; font-weight: bold; vertical-align: top;">{name}</td>
-                            <td style="padding: 10px; border: 1px solid #ddd; color: #d9534f; vertical-align: top;">{code}</td>
-                            <td style="padding: 10px; border: 1px solid #ddd; background-color: #fdf5f5; font-family: monospace; white-space: pre-wrap; font-size: 12px; vertical-align: top;">{snippet}</td>
-                        </tr>
-            """
-        html_body += """
-                    </tbody>
-                </table>
+            <div style="max-width: 800px; margin: 20px auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px; background-color: #fffaf0;">
+                <h2 style="color: {header_color}; border-bottom: 2px solid {header_color}; padding-bottom: 10px;">{header_text}</h2>
+                <p>{intro_text}</p>
+                {table_content}
                 <p style="font-size: 12px; color: #777; margin-top: 30px; border-top: 1px solid #ddd; padding-top: 10px;">
-                    This is an automated error report sent from your Railway scraper service.
+                    This is an automated status report sent from your Railway scraper service.
                 </p>
             </div>
         </body>
@@ -87,7 +100,7 @@ def send_error_email(errors):
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.send_message(msg)
 
-        print(f"📧 Error notification email sent successfully to {ERROR_RECIPIENT}.")
+        print(f"📧 Status notification email sent successfully to {ERROR_RECIPIENT}.")
     except Exception as e:
         print(f"❌ Failed to send error notification email: {e}")
 
@@ -154,9 +167,10 @@ def main():
     print("\n=========================================")
     print("🏁 Execution Summary")
     print("=========================================")
+    print("📧 Sending execution status email...")
+    send_status_email(execution_errors)
+
     if execution_errors:
-        print(f"⚠️ Service completed with {len(execution_errors)} error(s). Sending alert email...")
-        send_error_email(execution_errors)
         # Exit with error status to report failure to Railway logs
         sys.exit(1)
     else:
