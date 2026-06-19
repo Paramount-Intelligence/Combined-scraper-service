@@ -7,6 +7,10 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
+# Ensure UTF-8 output on all platforms (fixes Windows emoji crash)
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+
 # Load env variables from local file if running locally
 load_dotenv()
 
