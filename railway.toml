@@ -1,0 +1,8 @@
+[build]
+  builder = "DOCKERFILE"
+  dockerfilePath = "Dockerfile"
+
+[deploy]
+  startCommand = "python -u run_all.py"
+  restartPolicyType = "NEVER"
+  cronSchedule = "0 15 * * *"
