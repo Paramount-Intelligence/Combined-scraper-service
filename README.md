@@ -7,8 +7,8 @@ Instead of running continuous loops, the service runs once daily on a schedule t
 ---
 
 ## 📅 Schedule
-* **Execution Time**: **8:00 PM PKT** (Pakistan Standard Time) daily.
-* **Cron Expression**: `0 15 * * *` (15:00 UTC / 3:00 PM UTC) configured inside [railway.toml](railway.toml).
+* **Execution Time**: **11:30 PM PKT** (Pakistan Standard Time) daily.
+* **Cron Expression**: `30 18 * * *` (18:30 UTC / 6:30 PM UTC) configured inside [railway.toml](railway.toml).
 
 ---
 
