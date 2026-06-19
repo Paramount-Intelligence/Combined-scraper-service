@@ -115,7 +115,6 @@ CATEGORIES = [
 ]
 
 UNIVERSAL_CATEGORIES = [
-    "Fractional/Interim Exec",
     "Business Process and Operations",
     "GTM (Marketing + Sales)",
     "Research and Due Diligence",
