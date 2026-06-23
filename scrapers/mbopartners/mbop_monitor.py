@@ -593,11 +593,7 @@ def main():
                 print("⚠️  No opportunities found to seed on startup. Skipping...\n")
         else:
             print("⚙️  Restart — skipping silent reconciliation. Active monitoring will start immediately.\n")
-            
-        if ONCE_MODE:
-            print("✅ Once mode complete. Exiting...")
-            return
-            
+
         # ── MONITORING LOOP ──────────────────────────────────────────────────
         check_count = 0
         while True:
@@ -606,19 +602,20 @@ def main():
                 print(f"\n{'='*30}")
                 print(f"🔄 Check #{check_count} — {datetime.now(PKT).strftime('%H:%M:%S')} PKT")
                 print(f"{'='*30}")
-                
+
                 driver.get(Config.TARGET_URL)
                 time.sleep(10)
-                
+
                 all_projects = scan_for_projects(driver)
-                
+
                 if not all_projects:
                     print("⚠️  No projects found in this scan.")
+                    if ONCE_MODE:
+                        break
                 else:
                     new_projects = filter_new_projects(all_projects, seen_ids)
-                    
+
                     if TEST_MODE and all_projects and not seen_ids:
-                        # Test mode fallback: send one test alert if no new items
                         project = all_projects[0]
                         print(f"🧪 Test mode: sending alert for project '{project['title']}'")
                         send_notification(project)
@@ -631,10 +628,16 @@ def main():
                                 seen_ids.add(project["id"])
                     else:
                         print("⏳ No new opportunities detected.")
-                        
+
+                print(f"📊 Stats: {len(all_projects)} visible, {len(seen_ids)} total seen")
+
+                if ONCE_MODE:
+                    print("\n✅ Once mode complete. Exiting...")
+                    break
+
             except Exception as loop_err:
                 print(f"⚠️ Error in checks loop: {loop_err}")
-                
+
             time.sleep(Config.CHECK_INTERVAL)
             
     except Exception as e:

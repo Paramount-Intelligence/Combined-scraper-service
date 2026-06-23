@@ -448,16 +448,16 @@ def map_record_to_row(project: dict) -> list:
     # Source & Flat Platform mapping
     db_platform = project.get("platform", "fintalent")
     source_mapping = {
-        "fintalent": "FinTalent",
+        "fintalent": "Fintalent",
         "catalant": "Catalant",
         "btg": "BTG",
-        "movemeon": "MoveMeOn",
+        "movemeon": "Movemeon",
         "aquent": "Aquent",
         "eond": "EonD",
-        "mbopartners": "MBOPartners",
+        "mbopartners": "MBO Partners",
         "outsized": "Outsized",
         "reed": "Reed",
-        "talmix": "Talmix"
+        "talmix": "Talmix",
     }
     source_name = source_mapping.get(db_platform.lower(), db_platform.title())
     flat_platform_name = db_platform.upper()
