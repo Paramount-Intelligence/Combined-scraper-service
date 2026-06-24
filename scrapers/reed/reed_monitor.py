@@ -20,8 +20,12 @@ from dotenv import load_dotenv
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
-# Load .env file from this script's directory
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+# Load .env file from this script's directory, falling back to the parent directory if needed
+script_dir = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(dotenv_path=os.path.join(script_dir, ".env"))
+parent_env = os.path.join(os.path.dirname(os.path.dirname(script_dir)), ".env")
+if os.path.exists(parent_env):
+    load_dotenv(dotenv_path=parent_env)
 
 PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time (UTC+5)
 

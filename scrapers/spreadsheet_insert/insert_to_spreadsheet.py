@@ -257,7 +257,7 @@ Explain where the raw values were found (e.g. "Found salary: '£45,000 per annum
     for attempt in range(max_retries):
         try:
             completion = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="llama-3.1-8b-instant",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content}
