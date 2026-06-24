@@ -24,6 +24,7 @@ ERROR_RECIPIENT = os.getenv("ERROR_RECIPIENT", "irfaanexe@gmail.com")
 SCRAPERS = [
     ("Aquent", "scrapers/aquent/aquent_monitor.py"),
     ("Eond", "scrapers/eond/eond_monitor.py"),
+    ("Expert360", "scrapers/expert360/expert360_monitor.py"),
     ("MBOPartners", "scrapers/mbopartners/mbop_monitor.py"),
     ("Outsized", "scrapers/outsized/outsized_monitor.py"),
     ("Reed", "scrapers/reed/reed_monitor.py"),
