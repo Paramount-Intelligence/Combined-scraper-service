@@ -873,6 +873,22 @@ def setup_session(driver):
 # ============================
 # MAIN LOOP
 # ============================
+def initialize_driver_with_retry(max_attempts=3):
+    """Launch Chrome WebDriver with retries for transient container failures."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            driver = initialize_driver()
+            return driver
+        except Exception as e:
+            print(f"  ⚠️ Driver init failed (attempt {attempt}/{max_attempts}): {e}")
+            if attempt < max_attempts:
+                wait = 10 * attempt
+                print(f"  Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                print("  ❌ All driver init attempts exhausted.")
+                raise
+
 def main():
     print("=" * 50)
     print("🚀 EonD Project Monitor")
@@ -885,7 +901,12 @@ def main():
     if TEST_MODE:
         print("🧪 RUNNING IN TEST MODE — MongoDB operations skipped, sends 1 test email\n")
 
-    driver = initialize_driver()
+    try:
+        driver = initialize_driver_with_retry()
+    except Exception as e:
+        print(f"❌ Could not start Chrome after retries: {e}")
+        return
+
     try:
         if not setup_session(driver):
             print("❌ Failed to authenticate EonD session. Exiting...")
@@ -999,13 +1020,20 @@ def main():
                 except:
                     pass
                 time.sleep(Config.CHECK_INTERVAL)
-                driver = initialize_driver()
-                setup_session(driver)
+                try:
+                    driver = initialize_driver_with_retry()
+                    setup_session(driver)
+                except Exception as e2:
+                    print(f"❌ Driver re-init failed: {e2}")
+                    if ONCE_MODE:
+                        break
 
     except KeyboardInterrupt:
         print("\n⏹️ Monitor stopped by user.")
     except Exception as e:
+        import traceback
         print(f"\n💥 Fatal crash: {e}")
+        traceback.print_exc()
     finally:
         try:
             driver.quit()

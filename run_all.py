@@ -253,7 +253,7 @@ def main():
                 text=True,
                 encoding="utf-8",
                 check=True,
-                timeout=300
+                timeout=600
             )
             if result.stdout:
                 for line in result.stdout.splitlines():
@@ -263,7 +263,7 @@ def main():
                     print(f"  [Spreadsheet STDERR] {line}")
             print("✅ Finished Spreadsheet Insertion successfully.")
         except subprocess.TimeoutExpired:
-            err_msg = "Spreadsheet insertion timed out after 300s"
+            err_msg = "Spreadsheet insertion timed out after 600s"
             print(f"❌ {err_msg}")
             execution_errors.append(("Spreadsheet Insertion", -2, err_msg))
         except subprocess.CalledProcessError as e:

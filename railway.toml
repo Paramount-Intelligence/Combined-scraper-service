@@ -5,4 +5,4 @@
 [deploy]
   startCommand = "python -u run_all.py"
   restartPolicyType = "NEVER"
-  cronSchedule = "0 3 * * *"
+  cronSchedule = "30 12 * * *"

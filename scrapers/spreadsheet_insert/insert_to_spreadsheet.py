@@ -252,8 +252,8 @@ Explain where the raw values were found (e.g. "Found salary: '£45,000 per annum
     record_dump = {k: v for k, v in (extra_fields or {}).items() if k != "_id"}
     user_content = f"Title: {title}\nDescription: {description}\n\nFull DB record:\n{json.dumps(record_dump, default=str, indent=2)}"
     
-    max_retries = 5
-    retry_delay = 5
+    max_retries = 7
+    retry_delay = 10
     for attempt in range(max_retries):
         try:
             completion = groq_client.chat.completions.create(
@@ -268,8 +268,7 @@ Explain where the raw values were found (e.g. "Found salary: '£45,000 per annum
             raw = completion.choices[0].message.content
             result = json.loads(raw)
             reasoning = result.get("daily_rate_reasoning", "No reasoning provided.")
-            
-            # We will log the raw values extracted by LLM
+
             raw_low = result.get("raw_rate_low")
             raw_high = result.get("raw_rate_high")
             curr = result.get("rate_currency")
@@ -277,13 +276,29 @@ Explain where the raw values were found (e.g. "Found salary: '£45,000 per annum
             print(f"    🔍 LLM Extracted: {raw_low}-{raw_high} {curr}/{per} | Reasoning: {reasoning}")
             return result
         except Exception as e:
-            if "rate_limit" in str(e).lower() or "429" in str(e) or "limit reached" in str(e).lower():
-                print(f"    ⚠️ Groq rate limit hit (attempt {attempt + 1}/{max_retries}). Retrying in {retry_delay}s... error: {e}")
-                time.sleep(retry_delay)
-                retry_delay *= 2
+            err_str = str(e).lower()
+            err_type = type(e).__name__.lower()
+            is_rate_limit = (
+                "rate_limit" in err_str or "429" in str(e) or
+                "limit reached" in err_str or "too many requests" in err_str or
+                "ratelimit" in err_type or "rate" in err_type
+            )
+            is_transient = (
+                is_rate_limit or "503" in str(e) or "502" in str(e) or
+                "service unavailable" in err_str or "connection" in err_str or
+                "timeout" in err_str or "server" in err_type
+            )
+            if is_transient:
+                wait_time = retry_delay * (2 ** attempt)
+                # Cap at 120s to stay within orchestrator timeout budget
+                wait_time = min(wait_time, 120)
+                label = "rate limit" if is_rate_limit else "transient error"
+                print(f"    ⚠️ Groq {label} (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s... error: {e}")
+                time.sleep(wait_time)
             else:
-                print(f"    ⚠️ Groq API call failed: {e}")
+                print(f"    ⚠️ Groq API call failed (non-retryable): {e}")
                 return {}
+    print(f"    ⚠️ Groq API retries exhausted after {max_retries} attempts. Using defaults.")
     return {}
 
 def map_record_to_row(project: dict) -> list:
@@ -520,12 +535,15 @@ def process_uninserted_records():
     
     rows = []
     inserted_ids = []
-    for rec in records:
-        print(f"  → Mapping & Classifying: {rec.get('title', 'Untitled')[:40]}...")
+    for i, rec in enumerate(records):
+        print(f"  → [{i+1}/{len(records)}] Mapping & Classifying: {rec.get('title', 'Untitled')[:40]}...")
         row = map_record_to_row(rec)
         print(f"    📋 Mapped: Platform Category='{row[2]}' | Category='{row[3]}' | Universal='{row[4]}' | Industry='{row[7]}' | Rate={row[9]}-{row[10]} | Duration={row[11]}-{row[12]} | Value={row[18]}-{row[19]}")
         rows.append(row)
         inserted_ids.append(rec["_id"])
+        # Pace API calls to stay within Groq rate limits
+        if i < len(records) - 1:
+            time.sleep(3)
 
     # Send ALL rows as a single batch payload
     print(f"🚀 Sending single batch payload of {len(rows)} records to webhook...")
