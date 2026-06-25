@@ -13,19 +13,12 @@ from groq import Groq
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
-# Load .env file
-local_env = os.path.join(os.path.dirname(__file__), ".env")
-if os.path.exists(local_env):
-    load_dotenv(dotenv_path=local_env)
-else:
-    parent_dir = os.path.join(os.path.dirname(__file__), "..")
-    env_path = None
-    for root, dirs, files in os.walk(parent_dir):
-        if ".env" in files:
-            env_path = os.path.join(root, ".env")
-            break
-    if env_path:
-        load_dotenv(dotenv_path=env_path)
+# Load .env file from this script's directory, falling back to the grandparent directory (root)
+script_dir = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(dotenv_path=os.path.join(script_dir, ".env"))
+grandparent_env = os.path.join(os.path.dirname(os.path.dirname(script_dir)), ".env")
+if os.path.exists(grandparent_env):
+    load_dotenv(dotenv_path=grandparent_env)
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
@@ -515,16 +508,27 @@ def process_uninserted_records():
     # Allow target date to be specified as command-line argument
     if len(sys.argv) > 1:
         target_date_str = sys.argv[1]
-        print(f"📅 Using command line specified target date: {target_date_str}")
+        if target_date_str.lower() == "all":
+            print("📅 Processing ALL uninserted records (ignoring date filter)")
+            query = {
+                "inserted_to_sheet": {"$ne": True},
+                "platform": {"$ne": "reed"}
+            }
+        else:
+            print(f"📅 Using command line specified target date: {target_date_str}")
+            query = {
+                "inserted_to_sheet": {"$ne": True},
+                "detected_at": {"$regex": f"^{target_date_str}"},
+                "platform": {"$ne": "reed"}
+            }
     else:
         target_date_str = datetime.now().strftime("%Y-%m-%d")
         print(f"📅 Using default target date (today): {target_date_str}")
-
-    query = {
-        "inserted_to_sheet": {"$ne": True},
-        "detected_at": {"$regex": f"^{target_date_str}"},
-        "platform": {"$ne": "reed"}
-    }
+        query = {
+            "inserted_to_sheet": {"$ne": True},
+            "detected_at": {"$regex": f"^{target_date_str}"},
+            "platform": {"$ne": "reed"}
+        }
     
     records = list(collection.find(query))
     if not records:

@@ -394,31 +394,7 @@ def scan_for_projects(driver):
         )
         time.sleep(2)
         
-        # Click "Load more projects" button if present to load all projects (max 10 clicks)
-        max_clicks = 10
-        click_count = 0
-        last_card_count = 0
-        while click_count < max_clicks:
-            try:
-                current_cards = len(driver.find_elements(By.CSS_SELECTOR, "div.MuiCard-root"))
-                if current_cards == last_card_count and click_count > 0:
-                    print("  No new projects loaded after click. Stopping load more.")
-                    break
-                last_card_count = current_cards
 
-                load_more_button = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(text(), 'LOAD MORE PROJECTS', 'load more projects'), 'load more projects')]"))
-                )
-                print(f"  Found 'Load more projects' button (click #{click_count+1}). Clicking...")
-                driver.execute_script("arguments[0].click();", load_more_button)
-                click_count += 1
-                time.sleep(4)  # Wait for projects to load
-            except (TimeoutException, NoSuchElementException):
-                # No more "Load more projects" button found/clickable
-                break
-            except Exception as e:
-                print(f"  ⚠️ Error clicking 'Load more projects' button: {e}")
-                break
 
         cards = driver.find_elements(By.CSS_SELECTOR, "div.MuiCard-root")
         projects = []
