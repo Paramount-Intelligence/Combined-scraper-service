@@ -29,6 +29,43 @@ if not GROQ_API_KEY:
     print("⚠️ WARNING: GROQ_API_KEY is not set in the environment or .env file.")
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
+# Filter options
+FILTER_ENGLISH_ONLY = os.getenv("FILTER_ENGLISH_ONLY", "True").lower() == "true"
+
+def is_english(title: str, description: str) -> bool:
+    """Detect if the project is in English using langdetect if available, with a regex fallback."""
+    text = f"{title}\n{description}".strip()
+    if not text:
+        return True
+    
+    # 1. Try to use langdetect library
+    try:
+        from langdetect import detect
+        # Clean text to avoid langdetect errors on purely numeric/special char inputs
+        clean_text = re.sub(r'http\S+|[^\w\s]', '', text).strip()
+        if len(clean_text) > 10:
+            lang = detect(clean_text)
+            return lang == 'en'
+    except Exception:
+        pass
+
+    # 2. Heuristics fallback: CJK (Chinese, Japanese, Korean) character detection
+    cjk_pattern = re.compile(r'[\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7a3]')
+    if cjk_pattern.search(text):
+        return False
+
+    # 3. Cyrillic character detection
+    cyrillic_pattern = re.compile(r'[\u0400-\u04ff]')
+    if cyrillic_pattern.search(text):
+        return False
+
+    # 4. Check density of ASCII characters as last resort
+    ascii_chars = sum(1 for c in text if ord(c) < 128)
+    if len(text) > 0 and (ascii_chars / len(text)) < 0.60:
+        return False
+
+    return True
+
 # Valid option lists for dropdown consistency
 PLATFORM_CATEGORIES = [
     "Finance Modelling",
@@ -539,8 +576,18 @@ def process_uninserted_records():
     
     rows = []
     inserted_ids = []
+    skipped_count = 0
     for i, rec in enumerate(records):
-        print(f"  → [{i+1}/{len(records)}] Mapping & Classifying: {rec.get('title', 'Untitled')[:40]}...")
+        title = rec.get("title", "Untitled")
+        desc = rec.get("description", "")
+        
+        if FILTER_ENGLISH_ONLY and not is_english(title, desc):
+            print(f"  → [{i+1}/{len(records)}] 🚫 Skipping non-English job: {title[:40]}...")
+            inserted_ids.append(rec["_id"])
+            skipped_count += 1
+            continue
+            
+        print(f"  → [{i+1}/{len(records)}] Mapping & Classifying: {title[:40]}...")
         row = map_record_to_row(rec)
         print(f"    📋 Mapped: Platform Category='{row[2]}' | Category='{row[3]}' | Universal='{row[4]}' | Industry='{row[7]}' | Rate={row[9]}-{row[10]} | Duration={row[11]}-{row[12]} | Value={row[18]}-{row[19]}")
         rows.append(row)
@@ -549,8 +596,19 @@ def process_uninserted_records():
         if i < len(records) - 1:
             time.sleep(3)
 
+    if not rows:
+        print(f"💡 No rows to send to spreadsheet (all {skipped_count} new records were filtered as non-English).")
+        if inserted_ids:
+            # Mark them in MongoDB so we don't query/skip them next time
+            collection.update_many(
+                {"_id": {"$in": inserted_ids}},
+                {"$set": {"inserted_to_sheet": True}}
+            )
+            print(f"🎉 Updated {len(inserted_ids)} records in database.")
+        return
+
     # Send ALL rows as a single batch payload
-    print(f"🚀 Sending single batch payload of {len(rows)} records to webhook...")
+    print(f"🚀 Sending single batch payload of {len(rows)} records to webhook... (skipped {skipped_count} non-English)")
     try:
         response = requests.post(WEBHOOK_URL, json={"rows": rows}, timeout=60)
         
@@ -562,7 +620,7 @@ def process_uninserted_records():
                 {"_id": {"$in": inserted_ids}},
                 {"$set": {"inserted_to_sheet": True}}
             )
-            print(f"🎉 Finished processing. Successfully processed and updated {len(inserted_ids)} records.")
+            print(f"🎉 Finished processing. Successfully processed and updated {len(inserted_ids)} records (including {skipped_count} non-English skipped).")
         else:
              print(f"    ❌ Webhook returned unexpected status/body: {response.status_code} - {response.text}")
              print("    ⚠️ MongoDB flags left untouched to prevent data loss.")
