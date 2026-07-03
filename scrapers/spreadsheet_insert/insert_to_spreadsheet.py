@@ -331,6 +331,40 @@ Explain where the raw values were found (e.g. "Found salary: '£45,000 per annum
     print(f"    ⚠️ Groq API retries exhausted after {max_retries} attempts. Using defaults.")
     return {}
 
+def extract_country_or_na(project: dict) -> str:
+    """Extract normalized country or N/A for remote jobs based on location fields."""
+    loc = str(project.get("location", "")).lower()
+    loc_pref = str(project.get("location_pref", "")).lower()
+    rem = str(project.get("remote_type", "")).lower()
+    job_type = str(project.get("job_type", "")).lower()
+    
+    all_text = f"{loc} {loc_pref} {rem} {job_type}"
+    
+    remote_terms = ["remote", "fully remote", "work from home", "wfh", "anywhere", "global", "worldwide"]
+    for term in remote_terms:
+        pattern = r'(?<![a-z])' + re.escape(term) + r'(?![a-z])'
+        if re.search(pattern, all_text):
+            return "N/A"
+
+    country_map = {
+        "usa": "United States", "us": "United States", "u.s.": "United States", "u.s.a.": "United States", "united states": "United States",
+        "uk": "United Kingdom", "u.k.": "United Kingdom", "england": "United Kingdom", "united kingdom": "United Kingdom",
+        "uae": "United Arab Emirates", "u.a.e.": "United Arab Emirates", "united arab emirates": "United Arab Emirates",
+        "ksa": "Saudi Arabia", "saudi": "Saudi Arabia", "saudi arabia": "Saudi Arabia",
+        "germany": "Germany", "france": "France", "india": "India", "pakistan": "Pakistan",
+        "canada": "Canada", "australia": "Australia", "singapore": "Singapore",
+        "netherlands": "Netherlands", "spain": "Spain", "italy": "Italy",
+        "ireland": "Ireland", "malaysia": "Malaysia", "philippines": "Philippines"
+    }
+
+    sorted_keys = sorted(country_map.keys(), key=len, reverse=True)
+    for term in sorted_keys:
+        pattern = r'(?<![a-z])' + re.escape(term) + r'(?![a-z])'
+        if re.search(pattern, all_text):
+            return country_map[term]
+            
+    return ""
+
 def map_record_to_row(project: dict) -> list:
     """Build spreadsheet row list from deterministic and semantic LLM logic."""
     # 1. Deterministic/Metadata parsing
@@ -383,13 +417,7 @@ def map_record_to_row(project: dict) -> list:
         work_type = "Onsite"
 
     # Location cleaning
-    raw_location = project.get("location", "") or project.get("location_pref", "") or ""
-    clean_loc = re.sub(r'\b(person_pin_circle|location_on|place)\b', '', raw_location)
-    clean_loc = re.sub(r'\s+', ' ', clean_loc).strip()
-    if clean_loc.startswith(",") or clean_loc.startswith("-"):
-        clean_loc = clean_loc[1:].strip()
-    if not clean_loc:
-        clean_loc = "NaN"
+    clean_loc = extract_country_or_na(project)
 
     # 2. Call Groq for Semantic Classifications and Extraction
     title = project.get("title", "")

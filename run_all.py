@@ -19,7 +19,7 @@ SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 SENDER_PASSWORD = os.getenv("SENDER_PASSWORD")
-ERROR_RECIPIENT = os.getenv("ERROR_RECIPIENT", "irfaanexe@gmail.com")
+ERROR_RECIPIENT = os.getenv("ERROR_RECIPIENT", "ziadin.544@gmail.com")
 
 SCRAPERS = [
     ("Aquent", "scrapers/aquent/aquent_monitor.py"),
