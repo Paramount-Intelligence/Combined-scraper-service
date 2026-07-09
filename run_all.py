@@ -138,11 +138,32 @@ def send_status_email(errors, summaries=None):
     except Exception as e:
         print(f"❌ Failed to send error notification email: {e}")
 
+def log_browser_versions():
+    """Print Chromium/ChromeDriver versions and resolved paths at startup."""
+    import subprocess as _sp
+    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/chromium")
+    chromedriver_path = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+    print("🌐 Browser Environment:")
+    print(f"   CHROME_BIN         : {chrome_bin}")
+    print(f"   CHROMEDRIVER_PATH  : {chromedriver_path}")
+    try:
+        ver = _sp.check_output([chrome_bin, "--version"], stderr=_sp.STDOUT, timeout=10).decode().strip()
+        print(f"   Chromium version   : {ver}")
+    except Exception as e:
+        print(f"   Chromium version   : ⚠️ could not determine ({e})")
+    try:
+        ver = _sp.check_output([chromedriver_path, "--version"], stderr=_sp.STDOUT, timeout=10).decode().strip()
+        print(f"   ChromeDriver version: {ver}")
+    except Exception as e:
+        print(f"   ChromeDriver version: ⚠️ could not determine ({e})")
+    print()
+
 def main():
     print("=========================================")
     print("🚀 Starting Daily Scraper Service Orchestration")
     print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=========================================")
+    log_browser_versions()
 
     # Enforce email suppression for the scraper monitors
     os.environ["SEND_EMAILS"] = "False"

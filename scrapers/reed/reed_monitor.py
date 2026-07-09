@@ -564,67 +564,12 @@ def send_notification(job):
 # ============================
 # DRIVER SETUP
 # ============================
-def _find_binary(env_var, candidates):
-    import shutil
-    val = os.getenv(env_var, "")
-    if val and os.path.exists(val):
-        return val
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    found = shutil.which(candidates[-1].split('/')[-1])
-    return found or ""
-
 def initialize_driver():
-    """Launch Chrome WebDriver with anti-bot overrides."""
-    options = Options()
-    if Config.HEADLESS:
-        options.add_argument("--headless=new")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-setuid-sandbox")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-
-    chrome_bin = _find_binary("CHROME_BIN", [
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-    ])
-    if chrome_bin:
-        options.binary_location = chrome_bin
-
-    from selenium.webdriver.chrome.service import Service
-
-    system_path = _find_binary("CHROMEDRIVER_PATH", [
-        "/usr/bin/chromedriver",
-        "/usr/lib/chromium/chromedriver",
-        "/usr/lib/chromium-browser/chromedriver",
-    ])
-
-    if system_path:
-        service = Service(system_path)
-    else:
-        try:
-            from webdriver_manager.chrome import ChromeDriverManager
-            from webdriver_manager.core.os_manager import ChromeType
-            is_chromium = "chromium" in (chrome_bin or "").lower()
-            mgr = ChromeDriverManager(chrome_type=ChromeType.CHROMIUM if is_chromium else ChromeType.GOOGLE)
-            driver_path = mgr.install()
-            service = Service(driver_path)
-        except Exception:
-            service = Service()
-
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.execute_cdp_cmd("Network.setUserAgentOverride", {
-        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    })
-    return driver
+    """Launch Chrome WebDriver via shared chrome_helper (pinned Chromium build)."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from chrome_helper import build_driver
+    return build_driver()
 
 # ============================
 # MAIN LOOP

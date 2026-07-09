@@ -1,9 +1,12 @@
 FROM python:3.11-slim-bookworm
 
-# Install Chromium, Chromedriver, and system dependencies
-RUN apt-get update && apt-get install -y \
-    chromium \
-    chromium-driver \
+# Install pinned Chromium, ChromeDriver, and all required system libraries
+# Versions are locked to match the working reference Dockerfile.
+# apt-mark hold prevents accidental upgrades via apt-get upgrade.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium=147.0.7727.137-1~deb12u1 \
+    chromium-common=147.0.7727.137-1~deb12u1 \
+    chromium-driver=147.0.7727.137-1~deb12u1 \
     fonts-liberation \
     libasound2 \
     libatk-bridge2.0-0 \
@@ -23,16 +26,17 @@ RUN apt-get update && apt-get install -y \
     libxfixes3 \
     libxrandr2 \
     xdg-utils \
-    --no-install-recommends \
+    && apt-mark hold chromium chromium-common chromium-driver \
     && rm -rf /var/lib/apt/lists/*
 
+# Browser paths and headless flag — consumed by scrapers/chrome_helper.py
 ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 ENV HEADLESS=True
 
 WORKDIR /app
 
-# Copy requirements and install
+# Copy requirements and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
