@@ -226,7 +226,6 @@ Return ONLY a valid JSON object — no markdown, no explanation, no extra text.
 {{
   "platform_category": string,
   "category": string,
-  "universal_category": string,
   "industry": string,
   "industry_secondary": string,
   "role_type": string,
@@ -248,7 +247,6 @@ For each field (except platform_category), pick exactly one value from the allow
 
 - **platform_category** → A short, broad domain/category describing the project (e.g., "Data Analytics", "Finance Modelling", "HR Strategy"). You can pick one of these examples if it fits: {json.dumps(PLATFORM_CATEGORIES)}. If none of the examples fit, you must generate a new descriptive platform category describing the domain (keep it brief and capitalized like the examples). NEVER use "NaN", "None", null, or empty values.
 - **category** → {json.dumps(CATEGORIES)}
-- **universal_category** → {json.dumps(UNIVERSAL_CATEGORIES)}
 - **industry** → {json.dumps(INDUSTRIES)}
 - **industry_secondary** → {json.dumps(INDUSTRIES_SECONDARY)}
 - **role_type** → {json.dumps(ROLE_TYPES)}
@@ -435,10 +433,6 @@ def map_record_to_row(project: dict) -> list:
     if category not in CATEGORIES:
         category = "General Consulting"
 
-    universal_category_secondary = semantics.get("universal_category")
-    if universal_category_secondary not in UNIVERSAL_CATEGORIES:
-        universal_category_secondary = "General Consulting"
-
     industry = semantics.get("industry")
     if industry not in INDUSTRIES:
         industry = "OTHER"
@@ -541,7 +535,6 @@ def map_record_to_row(project: dict) -> list:
         posted_date_est,                                # Posted Date (est.)
         platform_category,                              # Platform Category
         category,                                       # Category
-        universal_category_secondary,                   # Universal Category - Secondary
         title,                                          # Project
         desc,                                           # Description
         industry,                                       # Industry
