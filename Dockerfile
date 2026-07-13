@@ -1,46 +1,54 @@
 FROM python:3.11-slim-bookworm
 
-# Install pinned Chromium, ChromeDriver, and all required system libraries
-# Versions are locked to match the working reference Dockerfile.
-# apt-mark hold prevents accidental upgrades via apt-get upgrade.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium=147.0.7727.137-1~deb12u1 \
-    chromium-common=147.0.7727.137-1~deb12u1 \
-    chromium-driver=147.0.7727.137-1~deb12u1 \
-    fonts-liberation \
-    libasound2 \
-    libatk-bridge2.0-0 \
-    libatk1.0-0 \
-    libcairo2 \
-    libcups2 \
-    libdbus-1-3 \
-    libgdk-pixbuf2.0-0 \
-    libgtk-3-0 \
-    libnspr4 \
-    libnss3 \
-    libpango-1.0-0 \
-    libx11-6 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxrandr2 \
-    xdg-utils \
-    && apt-mark hold chromium chromium-common chromium-driver \
-    && rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    CHROME_BIN=/usr/bin/chromium \
+    CHROMEDRIVER_PATH=/usr/bin/chromedriver \
+    HEADLESS=True
 
-# Browser paths and headless flag — consumed by scrapers/chrome_helper.py
-ENV CHROME_BIN=/usr/bin/chromium
-ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
-ENV HEADLESS=True
+# Install the Chromium and ChromeDriver versions currently available
+# from Debian Bookworm repositories. Debian keeps these compatible.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        chromium \
+        chromium-driver \
+        fonts-liberation \
+        ca-certificates \
+        libasound2 \
+        libatk-bridge2.0-0 \
+        libatk1.0-0 \
+        libcairo2 \
+        libcups2 \
+        libdbus-1-3 \
+        libgdk-pixbuf2.0-0 \
+        libgtk-3-0 \
+        libnspr4 \
+        libnss3 \
+        libpango-1.0-0 \
+        libx11-6 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxext6 \
+        libxfixes3 \
+        libxrandr2 \
+        xdg-utils \
+    && echo "Installed browser versions:" \
+    && chromium --version \
+    && chromedriver --version \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /tmp/*
 
 WORKDIR /app
 
-# Copy requirements and install Python dependencies
+# Install Python dependencies separately for Docker layer caching
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+# Copy application files
 COPY . .
 
 # Run the orchestrator
