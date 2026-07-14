@@ -210,6 +210,22 @@ INDUSTRIES_SECONDARY = [
 
 ROLE_TYPES = ["Consultant", "Interim/Temporary", "OTHER"]
 
+# Hard ceiling for consulting/freelance daily rates written to the spreadsheet (USD).
+MAX_DAILY_RATE_USD = 2500.0
+DEFAULT_DAILY_RATE_USD = 799.0
+
+def sanitize_daily_rate_usd(val: float) -> float:
+    """Clamp impossible LLM rate extractions; recover common dropped-decimal bugs."""
+    if val <= MAX_DAILY_RATE_USD:
+        return val
+    # e.g. "$66.95 Hourly" misread as 6695 → 6695*8 = 53560; ÷100 restores ~535.60
+    corrected = val / 100.0
+    if 50.0 <= corrected <= MAX_DAILY_RATE_USD:
+        print(f"    ⚠️ Daily rate ${val:,.2f} exceeds ${MAX_DAILY_RATE_USD:g}; corrected to ${corrected:,.2f} (÷100)")
+        return corrected
+    print(f"    ⚠️ Daily rate ${val:,.2f} exceeds ${MAX_DAILY_RATE_USD:g}; falling back to ${DEFAULT_DAILY_RATE_USD:g}")
+    return DEFAULT_DAILY_RATE_USD
+
 def query_groq_semantics(title, description, extra_fields=None):
     """Call Groq LLM to extract semantic classification and parameters in JSON format."""
     if not groq_client:
@@ -258,8 +274,10 @@ For each field (except platform_category), pick exactly one value from the allow
 ### raw_rate_low / raw_rate_high / rate_currency / rate_period
 Extract the raw numerical rate information exactly as stated in the fields or description.
 - Set `raw_rate_low` and `raw_rate_high` to the raw numbers (no currency symbols, no commas). If no rate exists, set both to null.
+- Preserve decimal points exactly (e.g. "$66.95" → 66.95, NOT 6695; "$77" → 77).
 - Set `rate_currency` to one of: "USD", "GBP", "EUR" based on the symbol or text (e.g. £ -> GBP, € -> EUR, $ -> USD).
 - Set `rate_period` to one of: "hourly", "daily", "monthly", "annually" based on how the rate is stated.
+- Sanity check (max daily rate $2500 USD): after converting to daily USD (hourly×8, monthly÷20, annually÷260; GBP×1.27, EUR×1.08), each daily rate must be ≤ 2500. If your extracted numbers would imply a daily USD rate above 2500, you almost certainly dropped a decimal or misread the amount — re-read the source and correct it. Typical consulting/freelance daily rates are roughly 200–2500 USD.
 
 ### duration_months_low / duration_months_high
 Extract contract length in months. If a range is specified (e.g. 3-6 months), set low to 3 and high to 6. If only one value is specified, use it for both low and high, never make up numbers from yourself. Default: 6.
@@ -363,6 +381,60 @@ def extract_country_or_na(project: dict) -> str:
             
     return ""
 
+def determine_work_type(project: dict) -> str:
+    """
+    Classify Work Type from location metadata and description text.
+
+    Soft onsite language (e.g. "occasionally on-site") must not force Onsite when
+    the role is primarily remote / hybrid.
+    """
+    meta = " ".join([
+        str(project.get("location", "")),
+        str(project.get("location_pref", "")),
+        str(project.get("remote_type", "")),
+        str(project.get("job_type", "")),
+    ]).lower()
+    # Description / title / project_length: scrapers (esp. BTG) often bury
+    # "primarily remote" outside structured location fields.
+    narrative = " ".join([
+        str(project.get("description", "")),
+        str(project.get("title", "")),
+        str(project.get("project_length", "")),
+    ]).lower()
+    all_text = f"{meta} {narrative}"
+
+    has_hybrid = "hybrid" in all_text
+    has_remote = any(w in all_text for w in [
+        "remote", "wfh", "work from home", "work-from-home",
+    ])
+    # Occasional / light onsite or travel — not a pure Onsite role
+    has_soft_onsite = bool(re.search(
+        r"(occasionally|occasional|rarely|light|limited|potential|minimal)\s+"
+        r"(on[\s-]?site|travel)|"
+        r"(very\s+)?occasional(ly)?\s+(travel|on[\s-]?site)|"
+        r"(light|potential|limited)\s*,?\s*(potential\s+)?travel",
+        all_text,
+    ))
+    # Strong onsite only when not soft/occasional phrasing
+    has_strong_onsite = bool(re.search(
+        r"(?<!\w)(onsite|on-site|on site)(?!\w)",
+        all_text,
+    )) and not has_soft_onsite
+
+    if has_hybrid:
+        return "Hybrid"
+    # Primarily remote + occasional on-site/travel → Hybrid (matches BTG labels)
+    if has_remote and (has_soft_onsite or has_strong_onsite):
+        return "Hybrid"
+    if has_remote:
+        return "Remote"
+    if has_strong_onsite:
+        return "Onsite"
+    # Soft onsite alone (no remote keyword) → Hybrid, not Onsite
+    if has_soft_onsite:
+        return "Hybrid"
+    return "Hybrid"
+
 def map_record_to_row(project: dict) -> list:
     """Build spreadsheet row list from deterministic and semantic LLM logic."""
     # 1. Deterministic/Metadata parsing
@@ -399,20 +471,8 @@ def map_record_to_row(project: dict) -> list:
     if not posted_date_est:
         posted_date_est = datetime.now().strftime("%m/%d/%Y")
 
-    # Work Type determination
-    work_type = "Hybrid"
-    loc_lower = str(project.get("location", "")).lower()
-    loc_pref_lower = str(project.get("location_pref", "")).lower()
-    rem_lower = str(project.get("remote_type", "")).lower()
-    job_type_lower = str(project.get("job_type", "")).lower()
-    
-    all_fields = loc_lower + " " + loc_pref_lower + " " + rem_lower + " " + job_type_lower
-    if any(w in all_fields for w in ["hybrid"]):
-        work_type = "Hybrid"
-    elif any(w in all_fields for w in ["remote", "wfh", "work from home"]):
-        work_type = "Remote"
-    elif any(w in all_fields for w in ["onsite", "on-site", "on site"]):
-        work_type = "Onsite"
+    # Work Type determination (metadata + description; soft onsite ≠ Onsite)
+    work_type = determine_work_type(project)
 
     # Location cleaning
     clean_loc = extract_country_or_na(project)
@@ -446,8 +506,8 @@ def map_record_to_row(project: dict) -> list:
         role_type = "OTHER"
 
     # Python-based Daily Rate Math Calculations
-    rate_low = 799.0
-    rate_high = 799.0
+    rate_low = DEFAULT_DAILY_RATE_USD
+    rate_high = DEFAULT_DAILY_RATE_USD
     
     raw_low_val = semantics.get("raw_rate_low")
     raw_high_val = semantics.get("raw_rate_high")
@@ -477,6 +537,10 @@ def map_record_to_row(project: dict) -> list:
             elif currency == "EUR":
                 val_low *= 1.08
                 val_high *= 1.08
+                
+            # 3. Cap / recover if LLM dropped a decimal (e.g. $66.95 → 6695 → $53,560/day)
+            val_low = sanitize_daily_rate_usd(val_low)
+            val_high = sanitize_daily_rate_usd(val_high)
                 
             rate_low = round(val_low, 2)
             rate_high = round(val_high, 2)
