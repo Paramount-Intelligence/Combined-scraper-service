@@ -644,11 +644,13 @@ def process_uninserted_records():
                 "platform": {"$ne": "reed"}
             }
     else:
-        target_date_str = datetime.now().strftime("%Y-%m-%d")
-        print(f"📅 Using default target date (today): {target_date_str}")
+        # No date filter by default: the inserted_to_sheet flag already prevents
+        # duplicates, and filtering by "today" permanently orphaned records when a
+        # run failed/timed out or when PKT-stamped detected_at crossed the UTC date.
+        target_date_str = "all uninserted"
+        print("📅 Processing ALL uninserted records (default)")
         query = {
             "inserted_to_sheet": {"$ne": True},
-            "detected_at": {"$regex": f"^{target_date_str}"},
             "platform": {"$ne": "reed"}
         }
     

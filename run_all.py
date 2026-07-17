@@ -274,7 +274,9 @@ def main():
                 text=True,
                 encoding="utf-8",
                 check=True,
-                timeout=600
+                # Generous limit: ~3s pacing + Groq call (with rate-limit retries)
+                # per record means big days easily exceed 10 minutes.
+                timeout=3600
             )
             if result.stdout:
                 for line in result.stdout.splitlines():
@@ -284,7 +286,7 @@ def main():
                     print(f"  [Spreadsheet STDERR] {line}")
             print("✅ Finished Spreadsheet Insertion successfully.")
         except subprocess.TimeoutExpired:
-            err_msg = "Spreadsheet insertion timed out after 600s"
+            err_msg = "Spreadsheet insertion timed out after 3600s"
             print(f"❌ {err_msg}")
             execution_errors.append(("Spreadsheet Insertion", -2, err_msg))
         except subprocess.CalledProcessError as e:
