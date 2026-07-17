@@ -620,8 +620,44 @@ def map_record_to_row(project: dict) -> list:
     ]
     return row
 
+# Send/mark progress every N mapped rows so a timeout or crash only loses the
+# current chunk instead of the whole run.
+CHUNK_SIZE = 20
+
+# Default lookback window (days). Old orphans beyond this are never picked up.
+LOOKBACK_DAYS = 3
+
+def flush_chunk(collection, rows, ids, skipped_ids):
+    """Post mapped rows to the webhook and mark all processed ids in MongoDB.
+
+    Returns True if progress was saved (or nothing to send), False on webhook
+    failure (flags left untouched so records are retried next run).
+    """
+    if rows:
+        print(f"🚀 Sending chunk of {len(rows)} row(s) to webhook...")
+        try:
+            response = requests.post(WEBHOOK_URL, json={"rows": rows}, timeout=60)
+            if response.status_code != 200:
+                print(f"    ❌ Webhook returned unexpected status/body: {response.status_code} - {response.text}")
+                print("    ⚠️ MongoDB flags left untouched for this chunk.")
+                return False
+            print("    ✅ Webhook accepted the chunk.")
+        except Exception as e:
+            print(f"    ❌ Failed to post chunk to webhook: {e}")
+            print("    ⚠️ MongoDB flags left untouched for this chunk.")
+            return False
+
+    all_ids = ids + skipped_ids
+    if all_ids:
+        collection.update_many(
+            {"_id": {"$in": all_ids}},
+            {"$set": {"inserted_to_sheet": True}}
+        )
+        print(f"    💾 Marked {len(all_ids)} record(s) as inserted in MongoDB.")
+    return True
+
 def process_uninserted_records():
-    """Main pipeline loop: pull new records, map, post to webhook in ONE batch."""
+    """Main pipeline loop: pull new records, map, post to webhook in chunks."""
     print("🔌 Connecting to MongoDB...")
     client = MongoClient(MONGO_URI)
     db = client["office_monitor"]
@@ -644,13 +680,16 @@ def process_uninserted_records():
                 "platform": {"$ne": "reed"}
             }
     else:
-        # No date filter by default: the inserted_to_sheet flag already prevents
-        # duplicates, and filtering by "today" permanently orphaned records when a
-        # run failed/timed out or when PKT-stamped detected_at crossed the UTC date.
-        target_date_str = "all uninserted"
-        print("📅 Processing ALL uninserted records (default)")
+        # Default: rolling window of the last LOOKBACK_DAYS days. Self-heals
+        # failed/missed runs (yesterday's leftovers get picked up today) without
+        # dragging in old orphans. detected_at is a "YYYY-MM-DD HH:MM:SS" string,
+        # so lexicographic $gte comparison works.
+        cutoff = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+        target_date_str = f"last {LOOKBACK_DAYS} days (since {cutoff})"
+        print(f"📅 Processing uninserted records from the {target_date_str}")
         query = {
             "inserted_to_sheet": {"$ne": True},
+            "detected_at": {"$gte": cutoff},
             "platform": {"$ne": "reed"}
         }
     
@@ -663,58 +702,46 @@ def process_uninserted_records():
     
     rows = []
     inserted_ids = []
-    skipped_count = 0
+    skipped_ids = []
+    total_sent = 0
+    total_skipped = 0
     for i, rec in enumerate(records):
         title = rec.get("title", "Untitled")
         desc = rec.get("description", "")
         
         if FILTER_ENGLISH_ONLY and not is_english(title, desc):
             print(f"  → [{i+1}/{len(records)}] 🚫 Skipping non-English job: {title[:40]}...")
-            inserted_ids.append(rec["_id"])
-            skipped_count += 1
-            continue
-            
-        print(f"  → [{i+1}/{len(records)}] Mapping & Classifying: {title[:40]}...")
-        row = map_record_to_row(rec)
-        print(f"    📋 Mapped: Platform Category='{row[2]}' | Category='{row[3]}' | Universal='{row[4]}' | Industry='{row[7]}' | Rate={row[9]}-{row[10]} | Duration={row[11]}-{row[12]} | Value={row[18]}-{row[19]}")
-        rows.append(row)
-        inserted_ids.append(rec["_id"])
-        # Pace API calls to stay within Groq rate limits
-        if i < len(records) - 1:
-            time.sleep(3)
-
-    if not rows:
-        print(f"💡 No rows to send to spreadsheet (all {skipped_count} new records were filtered as non-English).")
-        if inserted_ids:
-            # Mark them in MongoDB so we don't query/skip them next time
-            collection.update_many(
-                {"_id": {"$in": inserted_ids}},
-                {"$set": {"inserted_to_sheet": True}}
-            )
-            print(f"🎉 Updated {len(inserted_ids)} records in database.")
-        return
-
-    # Send ALL rows as a single batch payload
-    print(f"🚀 Sending single batch payload of {len(rows)} records to webhook... (skipped {skipped_count} non-English)")
-    try:
-        response = requests.post(WEBHOOK_URL, json={"rows": rows}, timeout=60)
-        
-        if response.status_code == 200:
-            print("    ✅ Webhook accepted the batch payload.")
-            
-            # Update database to mark records as inserted
-            collection.update_many(
-                {"_id": {"$in": inserted_ids}},
-                {"$set": {"inserted_to_sheet": True}}
-            )
-            print(f"🎉 Finished processing. Successfully processed and updated {len(inserted_ids)} records (including {skipped_count} non-English skipped).")
+            skipped_ids.append(rec["_id"])
+            total_skipped += 1
         else:
-             print(f"    ❌ Webhook returned unexpected status/body: {response.status_code} - {response.text}")
-             print("    ⚠️ MongoDB flags left untouched to prevent data loss.")
-             
-    except Exception as e:
-        print(f"    ❌ Failed to post batch payload to webhook: {e}")
-        print("    ⚠️ MongoDB flags left untouched.")
+            print(f"  → [{i+1}/{len(records)}] Mapping & Classifying: {title[:40]}...")
+            row = map_record_to_row(rec)
+            print(f"    📋 Mapped: Platform Category='{row[2]}' | Category='{row[3]}' | Universal='{row[4]}' | Industry='{row[7]}' | Rate={row[9]}-{row[10]} | Duration={row[11]}-{row[12]} | Value={row[18]}-{row[19]}")
+            rows.append(row)
+            inserted_ids.append(rec["_id"])
+            # Pace API calls to stay within Groq rate limits
+            if i < len(records) - 1:
+                time.sleep(1)
+
+        # Persist progress every CHUNK_SIZE mapped rows
+        if len(rows) >= CHUNK_SIZE:
+            if not flush_chunk(collection, rows, inserted_ids, skipped_ids):
+                print("🛑 Stopping run after webhook failure; unsent records will be retried next run.")
+                return
+            total_sent += len(rows)
+            rows, inserted_ids, skipped_ids = [], [], []
+
+    # Flush whatever is left (also marks trailing non-English skips)
+    if rows or skipped_ids:
+        if not flush_chunk(collection, rows, inserted_ids, skipped_ids):
+            print("🛑 Final chunk failed; unsent records will be retried next run.")
+            return
+        total_sent += len(rows)
+
+    if total_sent == 0 and total_skipped > 0:
+        print(f"💡 No rows sent to spreadsheet (all {total_skipped} new records were filtered as non-English).")
+    else:
+        print(f"🎉 Finished processing. Sent {total_sent} row(s) to the sheet (skipped {total_skipped} non-English).")
 
 if __name__ == "__main__":
     process_uninserted_records()
