@@ -1,6 +1,6 @@
 # Combined Scraper Service
 
-This service consolidates the monitoring and spreadsheet insertion tasks for the 6 scrapers (`aquent`, `eond`, `mbopartners`, `outsized`, `reed`, and `talmix`) into a single execution workflow deployed on Railway.
+This service consolidates the monitoring and spreadsheet insertion tasks for the scrapers (`aquent`, `consultingheads`, `eond`, `expert360`, `mbopartners`, `outsized`, `outvise`, `reed`, and `talmix`) into a single execution workflow deployed on Railway.
 
 Instead of running continuous loops, the service runs once daily on a schedule to fetch new projects, save them to MongoDB, post them to your spreadsheet webhook, and shutdown cleanly to minimize costs.
 
@@ -43,6 +43,12 @@ EOND_EMAIL=your_eond_email
 EOND_PASSWORD=your_eond_password
 TALMIX_EMAIL=your_talmix_email
 TALMIX_PASSWORD=your_talmix_password
+OUTVISE_EMAIL=your_outvise_email
+OUTVISE_PASSWORD=your_outvise_password
+# Optional: set after you know the logged-in opportunities URL
+# OUTVISE_TARGET_URL=https://www.outvise.com/...
+CONSULTINGHEADS_EMAIL=your_consultingheads_email
+CONSULTINGHEADS_PASSWORD=your_consultingheads_password
 ```
 
 ---

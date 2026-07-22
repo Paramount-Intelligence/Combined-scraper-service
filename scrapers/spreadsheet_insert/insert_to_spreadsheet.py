@@ -590,6 +590,8 @@ def map_record_to_row(project: dict) -> list:
         "reed": "Reed",
         "talmix": "Talmix",
         "expert360": "Expert360",
+        "outvise": "Outvise",
+        "consultingheads": "ConsultingHeads",
     }
     source_name = source_mapping.get(db_platform.lower(), db_platform.title())
     flat_platform_name = db_platform.upper()

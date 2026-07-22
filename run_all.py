@@ -23,10 +23,12 @@ ERROR_RECIPIENT = os.getenv("ERROR_RECIPIENT", "ziadin.544@gmail.com")
 
 SCRAPERS = [
     ("Aquent", "scrapers/aquent/aquent_monitor.py"),
+    ("ConsultingHeads", "scrapers/consultingheads/consultingheads_monitor.py"),
     ("Eond", "scrapers/eond/eond_monitor.py"),
     ("Expert360", "scrapers/expert360/expert360_monitor.py"),
     ("MBOPartners", "scrapers/mbopartners/mbop_monitor.py"),
     ("Outsized", "scrapers/outsized/outsized_monitor.py"),
+    ("Outvise", "scrapers/outvise/outvise_monitor.py"),
     ("Reed", "scrapers/reed/reed_monitor.py"),
     ("Talmix", "scrapers/talmix/talmix_monitor.py"),
 ]
@@ -213,7 +215,8 @@ def main():
             login_failed = any(marker in stdout_lower for marker in [
                 "failed to authenticate", "failed to establish", "login failed",
                 "could not find email", "cookies expired", "session expired",
-                "failed to load cookies", "re-login failed"
+                "failed to load cookies", "re-login failed", "authentication failed",
+                "email or password are incorrect",
             ])
             no_projects = any(marker in stdout_lower for marker in [
                 "no projects found", "no jobs found", "no opportunities found",
