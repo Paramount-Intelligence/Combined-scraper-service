@@ -20,14 +20,16 @@ from dotenv import load_dotenv
 
 # Ensure UTF-8 output on all platforms (fixes Windows emoji crash)
 if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', line_buffering=True)
 
-# Load .env file from this script's directory (or parent if not present)
-local_env = os.path.join(os.path.dirname(__file__), ".env")
-if os.path.exists(local_env):
-    load_dotenv(dotenv_path=local_env)
-else:
-    load_dotenv()
+# Load .env: local scraper dir first, then repo root
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_root_dir = os.path.abspath(os.path.join(_script_dir, "..", ".."))
+if os.path.exists(os.path.join(_script_dir, ".env")):
+    load_dotenv(dotenv_path=os.path.join(_script_dir, ".env"))
+load_dotenv(dotenv_path=os.path.join(_root_dir, ".env"))
 
 PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time (UTC+5)
 
@@ -38,10 +40,17 @@ class Config:
     PLATFORM_NAME = "expert360"
     SESSION_KEY = "expert360_cookies"
     PROJECTS_COLLECTION = "projects"  # Shared MongoDB collection
-    
-    EXPRESS_EMAIL    = os.getenv("EXPRESS_EMAIL")
-    EXPRESS_PASSWORD = os.getenv("EXPRESS_PASSWORD")
-    
+
+    # Legacy Express naming kept; EXPERT360_* aliases also accepted
+    EXPRESS_EMAIL = (
+        os.getenv("EXPERT360_EMAIL")
+        or os.getenv("EXPRESS_EMAIL")
+    )
+    EXPRESS_PASSWORD = (
+        os.getenv("EXPERT360_PASSWORD")
+        or os.getenv("EXPRESS_PASSWORD")
+    )
+
     SMTP_SERVER  = os.getenv("SMTP_SERVER", "smtp.gmail.com")
     SMTP_PORT    = int(os.getenv("SMTP_PORT", 587))
     SENDER_EMAIL    = os.getenv("SENDER_EMAIL")
@@ -49,13 +58,21 @@ class Config:
     RECIPIENT_EMAILS = [
         e.strip() for e in os.getenv("RECIPIENT_EMAILS", "").split(",") if e.strip()
     ]
-    
-    HEADLESS     = os.getenv("HEADLESS", "True").lower() == "true"
-    COOKIES_FILE = "expert360_cookies.json"
+
+    # Expert360 bot challenges block standard headless Chrome; default headed unless overridden
+    _e360_hl = os.getenv("EXPERT360_HEADLESS")
+    if _e360_hl is None:
+        HEADLESS = False
+    else:
+        HEADLESS = _e360_hl.lower() == "true"
+    COOKIES_FILE = os.path.join(_script_dir, "expert360_cookies.json")
     MONGO_URI    = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
-    
+
     BASE_URL    = "https://app.expert360.com"
-    TARGET_URL  = "https://app.expert360.com/browse"
+    TARGET_URL  = os.getenv("EXPERT360_TARGET_URL", "https://app.expert360.com/browse").strip()
+    LOGIN_URL   = "https://app.expert360.com/login?next=%2Fbrowse"
+    CHALLENGE_WAIT_SECONDS = int(os.getenv("EXPERT360_CHALLENGE_WAIT", "90"))
+
 
 # CLI Options
 DEBUG_MODE = "--debug" in sys.argv or True
@@ -154,7 +171,7 @@ def save_cookies(driver):
         print(f"  ⚠️ Could not save cookies to MongoDB: {e}")
         return False
 
-def load_cookies(driver):
+def load_cookies(driver, wipe_existing=False):
     """Load cookies and localStorage from MongoDB or local backup file."""
     session_data = None
     try:
@@ -164,59 +181,156 @@ def load_cookies(driver):
             print("  Loaded cookies from MongoDB")
     except Exception as e:
         print(f"  ⚠️ Could not load cookies from MongoDB: {e}")
-        
+
     if not session_data:
         if os.path.exists(Config.COOKIES_FILE):
             try:
-                with open(Config.COOKIES_FILE, 'r') as f:
+                with open(Config.COOKIES_FILE, "r", encoding="utf-8") as f:
                     session_data = json.load(f)
                 print("  Loaded cookies from local file")
-            except:
+            except Exception:
                 pass
-                
+
     if not session_data or not session_data.get("cookies"):
         return False
-        
+
     try:
         driver.get(Config.BASE_URL)
         time.sleep(2)
-        driver.delete_all_cookies()
-        
+        wait_out_security_challenge(driver, timeout=min(60, Config.CHALLENGE_WAIT_SECONDS))
+        if wipe_existing:
+            driver.delete_all_cookies()
+
         for cookie in session_data["cookies"]:
-            if 'domain' in cookie and ('expert360.com' in cookie['domain']):
+            if "domain" in cookie and ("expert360.com" in cookie["domain"]):
                 try:
-                    driver.add_cookie(cookie)
+                    # Selenium rejects some cookie keys from Chrome export
+                    c = {k: v for k, v in cookie.items() if k in (
+                        "name", "value", "domain", "path", "expiry", "secure", "httpOnly", "sameSite"
+                    )}
+                    if "expiry" in c and isinstance(c["expiry"], float):
+                        c["expiry"] = int(c["expiry"])
+                    driver.add_cookie(c)
                 except Exception:
                     pass
-                    
-        # Apply local storage if saved
+
         if session_data.get("local_storage"):
             for key, val in session_data["local_storage"].items():
                 try:
-                    driver.execute_script("window.localStorage.setItem(arguments[0], arguments[1]);", key, val)
-                except:
+                    driver.execute_script(
+                        "window.localStorage.setItem(arguments[0], arguments[1]);", key, val
+                    )
+                except Exception:
                     pass
         return True
     except Exception as e:
         print(f"  ⚠️ Error applying cookies: {e}")
         return False
 
-def is_logged_in(driver):
-    """Check if we are successfully logged in and on dashboard/overview/project/browse page."""
+def page_body_text(driver, limit=2000):
     try:
-        current_url = driver.current_url.lower()
-        if "login" in current_url or "signin" in current_url or "auth" in current_url:
-            return False
-        return "browse" in current_url or "projects" in current_url or "dashboard" in current_url
-    except:
+        return (driver.find_element(By.TAG_NAME, "body").text or "")[:limit]
+    except Exception:
+        return ""
+
+
+def is_security_challenge(driver):
+    """True when Expert360/Cloudflare interstitial is blocking the app."""
+    try:
+        body = page_body_text(driver).lower()
+        title = (driver.title or "").lower()
+        url = (driver.current_url or "").lower()
+        markers = [
+            "performing security verification",
+            "checking your browser",
+            "just a moment",
+            "attention required",
+            "cf-browser-verification",
+            "challenge-platform",
+            "enable javascript and cookies",
+            "verify you are human",
+        ]
+        if any(m in body or m in title for m in markers):
+            return True
+        # Cloudflare challenge iframe / turnstile
+        for sel in [
+            "iframe[src*='challenge']",
+            "iframe[src*='turnstile']",
+            "#challenge-form",
+            ".cf-challenge",
+        ]:
+            if driver.find_elements(By.CSS_SELECTOR, sel):
+                return True
+        if "cdn-cgi/challenge" in url:
+            return True
         return False
+    except Exception:
+        return False
+
+
+def wait_out_security_challenge(driver, timeout=None):
+    """Poll until security challenge clears or timeout. Returns True if cleared."""
+    timeout = timeout if timeout is not None else Config.CHALLENGE_WAIT_SECONDS
+    if not is_security_challenge(driver):
+        return True
+    print(f"  🛡️ Security challenge detected — waiting up to {timeout}s...")
+    deadline = time.time() + timeout
+    last_log = 0
+    while time.time() < deadline:
+        time.sleep(2)
+        if not is_security_challenge(driver):
+            print("  ✅ Security challenge cleared")
+            time.sleep(2)
+            return True
+        elapsed = int(timeout - (deadline - time.time()))
+        if elapsed - last_log >= 15:
+            print(f"  … still verifying ({elapsed}s) URL={driver.current_url}")
+            last_log = elapsed
+    print("  ❌ Security challenge did not clear in time")
+    return False
+
+
+def has_marketplace_cards(driver):
+    try:
+        return bool(driver.find_elements(By.CSS_SELECTOR, "a[href*='/project/']"))
+    except Exception:
+        return False
+
+
+def is_logged_in(driver):
+    """True only when browse/app is reachable and not stuck on challenge/login."""
+    try:
+        if is_security_challenge(driver):
+            return False
+        current_url = (driver.current_url or "").lower()
+        if any(x in current_url for x in ("/login", "signin", "/auth", "sign-in")):
+            return False
+        # Marketplace cards are the strongest signal
+        if has_marketplace_cards(driver):
+            return True
+        body = page_body_text(driver).lower()
+        if "sign in" in body and "password" in body and "email" in body:
+            return False
+        # Authenticated shell without cards yet
+        if ("browse" in current_url or "projects" in current_url or "dashboard" in current_url):
+            if any(t in body for t in ("browse", "projects", "opportunities", "saved", "profile", "log out", "sign out")):
+                return True
+        return False
+    except Exception:
+        return False
+
 
 def perform_login(driver):
     """Log in to Expert360 using credentials."""
     try:
-        print(f"  Navigating to Expert360 login URL: {Config.BASE_URL}/login")
-        driver.get(f"{Config.BASE_URL}/login?next=%2Fbrowse")
-        time.sleep(5)
+        if not Config.EXPRESS_EMAIL or not Config.EXPRESS_PASSWORD:
+            print("❌ EXPRESS_EMAIL / EXPRESS_PASSWORD (or EXPERT360_*) not set in .env")
+            return False
+
+        print(f"  Navigating to Expert360 login URL: {Config.LOGIN_URL}")
+        driver.get(Config.LOGIN_URL)
+        time.sleep(3)
+        wait_out_security_challenge(driver)
 
         if is_logged_in(driver):
             print("  Already authenticated.")
@@ -229,7 +343,7 @@ def perform_login(driver):
                     EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
                 )
                 break
-            except:
+            except Exception:
                 continue
 
         if not email_field:
@@ -249,7 +363,7 @@ def perform_login(driver):
                     EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
                 )
                 break
-            except:
+            except Exception:
                 continue
 
         if not password_field:
@@ -265,10 +379,18 @@ def perform_login(driver):
         password_field.send_keys(Keys.ENTER)
         print("  Submitted login form via Enter")
         time.sleep(5)
+        wait_out_security_challenge(driver)
 
         # Fallback submit button click
         if not is_logged_in(driver):
-            for sel in ["button[type='submit']", "input[type='submit']", "button[id*='submit']", "button[class*='btn-primary']", "button[class*='SignIn']", "//button[contains(text(), 'Sign In') or contains(text(), 'Login')]"]:
+            for sel in [
+                "button[type='submit']",
+                "input[type='submit']",
+                "button[id*='submit']",
+                "button[class*='btn-primary']",
+                "button[class*='SignIn']",
+                "//button[contains(text(), 'Sign In') or contains(text(), 'Login')]",
+            ]:
                 try:
                     if sel.startswith("//"):
                         btn = driver.find_element(By.XPATH, sel)
@@ -277,18 +399,27 @@ def perform_login(driver):
                     driver.execute_script("arguments[0].click();", btn)
                     print("  Clicked login button")
                     time.sleep(5)
+                    wait_out_security_challenge(driver)
                     break
-                except:
+                except Exception:
                     continue
 
-        # Wait up to 15 seconds for dashboard/browse redirection
-        for _ in range(15):
+        # Wait up to 30 seconds for dashboard/browse redirection
+        for _ in range(30):
             time.sleep(1)
+            wait_out_security_challenge(driver, timeout=5)
             if is_logged_in(driver):
                 break
+            # Navigate to browse if login landed elsewhere
+            if "login" not in (driver.current_url or "").lower() and not has_marketplace_cards(driver):
+                driver.get(Config.TARGET_URL)
+                time.sleep(3)
+                wait_out_security_challenge(driver)
         else:
-            print(f"❌ Login redirect failed. URL: {driver.current_url}")
-            return False
+            if not is_logged_in(driver):
+                print(f"❌ Login redirect failed. URL: {driver.current_url}")
+                dump_page_structure(driver)
+                return False
 
         save_cookies(driver)
         print(f"✅ Login successful -> {driver.current_url}")
@@ -374,29 +505,48 @@ def extract_card_info(card):
 def scan_for_projects(driver):
     """Scrape the browse page for project cards."""
     try:
-        if not is_logged_in(driver):
-            driver.get(Config.TARGET_URL)
-            time.sleep(5)
-            
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/project/']"))
-        )
+        driver.get(Config.TARGET_URL)
         time.sleep(3)
-        
+        if not wait_out_security_challenge(driver):
+            dump_page_structure(driver)
+            return []
+
+        if not is_logged_in(driver):
+            print("  Session expired during scan — need re-login")
+            return []
+
+        # Wait for cards (challenge may have delayed SPA hydration)
+        try:
+            WebDriverWait(driver, 30).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/project/']"))
+            )
+        except TimeoutException:
+            # Soft scroll / refresh once if shell loaded but cards missing
+            print("  No cards yet — scrolling and refreshing once...")
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(2)
+            driver.refresh()
+            time.sleep(3)
+            wait_out_security_challenge(driver)
+            WebDriverWait(driver, 25).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/project/']"))
+            )
+
+        time.sleep(2)
         cards = driver.find_elements(By.CSS_SELECTOR, "a[href*='/project/']")
         projects = []
         seen_hrefs = set()
-        
+
         for card in cards:
             href = card.get_attribute("href")
             if not href or href in seen_hrefs:
                 continue
             seen_hrefs.add(href)
-            
+
             p = extract_card_info(card)
             if p and p.get("title"):
                 projects.append(p)
-                
+
         print(f"✅ Found {len(projects)} projects on Expert360 marketplace.")
         return projects
     except TimeoutException:
@@ -691,12 +841,166 @@ def send_notification(project):
 # ============================
 # DRIVER SETUP
 # ============================
+def _detect_chrome_major():
+    """Best-effort installed Chrome major version (Windows registry / binary path)."""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome\BLBeacon")
+        ver, _ = winreg.QueryValueEx(key, "version")
+        return int(str(ver).split(".")[0])
+    except Exception:
+        pass
+    for path in (
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    ):
+        try:
+            if os.path.exists(path):
+                # Parent dirs are version folders sometimes; FileVersion via powershell is heavier —
+                # read adjacent version folder name.
+                parent = os.path.dirname(path)
+                for name in os.listdir(parent):
+                    if name[0].isdigit() and "." in name:
+                        return int(name.split(".")[0])
+        except Exception:
+            continue
+    return None
+
+
+def _clear_profile_locks(profile_dir):
+    if not profile_dir or not os.path.isdir(profile_dir):
+        return
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"):
+        path = os.path.join(profile_dir, name)
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+
 def initialize_driver():
-    """Launch Chrome WebDriver via shared chrome_helper (pinned Chromium build)."""
+    """
+    Launch Chrome with anti-bot hardening.
+    Prefers undetected-chromedriver for Expert360's security interstitial;
+    falls back to shared chrome_helper if UC is unavailable.
+    """
     import sys as _sys
     _sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from chrome_helper import build_driver
-    return build_driver()
+
+    profile_dir = os.path.join(_script_dir, ".chrome_profile")
+    os.makedirs(profile_dir, exist_ok=True)
+    _clear_profile_locks(profile_dir)
+    chrome_major = _detect_chrome_major()
+    print(
+        f"  Starting Chrome (HEADLESS={Config.HEADLESS}, "
+        f"chrome_major={chrome_major}, profile={profile_dir})"
+    )
+
+    # 1) Prefer undetected-chromedriver (bypasses Expert360 security verification)
+    try:
+        import undetected_chromedriver as uc
+
+        last_err = None
+        for attempt, use_profile in enumerate((True, False), start=1):
+            try:
+                options = uc.ChromeOptions()
+                options.add_argument("--lang=en-US,en")
+                options.add_argument("--window-size=1920,1080")
+                options.add_argument("--no-first-run")
+                options.add_argument("--no-default-browser-check")
+                options.add_argument("--disable-popup-blocking")
+                if use_profile:
+                    _clear_profile_locks(profile_dir)
+                    options.add_argument(f"--user-data-dir={profile_dir}")
+                if Config.HEADLESS:
+                    options.add_argument("--headless=new")
+                    options.add_argument("--disable-gpu")
+
+                kwargs = {
+                    "options": options,
+                    "headless": Config.HEADLESS,
+                    "use_subprocess": True,
+                }
+                if chrome_major:
+                    kwargs["version_main"] = chrome_major
+
+                print(f"  UC attempt {attempt} (persistent_profile={use_profile})...")
+                driver = uc.Chrome(**kwargs)
+                print("  ✅ Using undetected-chromedriver")
+                return driver
+            except Exception as e:
+                last_err = e
+                print(f"  ⚠️ UC attempt {attempt} failed: {e}")
+        raise last_err
+    except Exception as e:
+        print(f"  ⚠️ undetected-chromedriver unavailable ({e}); falling back to chrome_helper")
+
+    # 2) Fallback: shared helper + CDP stealth (no locked custom profile)
+    prev_headless = os.environ.get("HEADLESS")
+    os.environ["HEADLESS"] = "True" if Config.HEADLESS else "False"
+    try:
+        from chrome_helper import build_driver
+        extra = [
+            "--lang=en-US,en",
+            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        ]
+        driver = build_driver(extra_options=extra)
+        try:
+            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": """
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    window.chrome = window.chrome || { runtime: {} };
+                    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                """
+            })
+            driver.execute_cdp_cmd("Network.setUserAgentOverride", {
+                "userAgent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                )
+            })
+        except Exception as e:
+            print(f"  ⚠️ Stealth CDP hooks failed (continuing): {e}")
+        return driver
+    finally:
+        if prev_headless is None:
+            os.environ.pop("HEADLESS", None)
+        else:
+            os.environ["HEADLESS"] = prev_headless
+
+
+def ensure_authenticated(driver):
+    """Open browse, clear challenge, re-login if needed. Returns True if ready."""
+    # First try persistent profile session without wiping cookies
+    driver.get(Config.TARGET_URL)
+    time.sleep(3)
+    wait_out_security_challenge(driver)
+    if is_logged_in(driver) or has_marketplace_cards(driver):
+        print("  ✅ Authenticated via browser profile/session")
+        return True
+
+    print("  Profile session incomplete — applying saved cookies...")
+    load_cookies(driver, wipe_existing=False)
+    driver.get(Config.TARGET_URL)
+    time.sleep(3)
+    wait_out_security_challenge(driver)
+    if is_logged_in(driver) or has_marketplace_cards(driver):
+        print("  ✅ Authenticated via saved cookies")
+        return True
+
+    print("🔑 Session not found, expired, or blocked. Logging in...")
+    if not perform_login(driver):
+        return False
+
+    driver.get(Config.TARGET_URL)
+    time.sleep(3)
+    wait_out_security_challenge(driver)
+    return is_logged_in(driver) or has_marketplace_cards(driver)
+
 
 # ============================
 # MAIN RUNNER
@@ -706,19 +1010,30 @@ def main():
     print("🚀 Expert360 Monitor (One-Time Run)")
     print("=" * 50)
     print(f"  Target    : {Config.TARGET_URL}")
+    print(f"  Email set : {bool(Config.EXPRESS_EMAIL)}")
+    print(f"  Headless  : {Config.HEADLESS}")
     print(f"  Recipients: {', '.join(Config.RECIPIENT_EMAILS)}")
     print()
 
     driver = initialize_driver()
     try:
-        has_session = load_cookies(driver)
-        driver.get(Config.TARGET_URL)
-        time.sleep(5)
-
-        if not is_logged_in(driver):
-            print("🔑 Session not found or expired. Logging in...")
-            if not perform_login(driver):
-                print("❌ Authentication failed. Exiting.")
+        if not ensure_authenticated(driver):
+            # Headless challenges often never clear — one retry with headed Chrome
+            if Config.HEADLESS:
+                print("⚠️ Auth failed under headless. Retrying with headed Chrome...")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                Config.HEADLESS = False
+                driver = initialize_driver()
+                if not ensure_authenticated(driver):
+                    print("❌ Authentication / security challenge failed. Exiting.")
+                    dump_page_structure(driver)
+                    return
+            else:
+                print("❌ Authentication / security challenge failed. Exiting.")
+                dump_page_structure(driver)
                 return
 
         init_db()
@@ -727,11 +1042,18 @@ def main():
         print(f"📁 Database loaded — {len(seen_ids)} Expert360 records detected")
 
         all_projects = scan_for_projects(driver)
+        if not all_projects and not is_logged_in(driver):
+            print("🔑 Lost session during scan — re-authenticating once...")
+            if ensure_authenticated(driver):
+                all_projects = scan_for_projects(driver)
+
         if not all_projects:
             print("⚠️ No projects found on the browse page.")
+            dump_page_structure(driver)
             return
 
         new_projects = [p for p in all_projects if p["id"] not in seen_ids]
+        print(f"📊 Stats: {len(all_projects)} visible, {len(seen_ids)} total seen, {len(new_projects)} new")
 
         if cold_start:
             print("⚙️ Cold start: seeding database silently with current page listings...")
@@ -747,7 +1069,7 @@ def main():
                 print(f"  → [{idx+1}/{len(new_projects)}] Fetching details for '{p['title'][:40]}'...")
                 details = fetch_project_details(driver, p["url"])
                 p.update(details)
-                
+
                 emailed = send_notification(p)
                 insert_project(p, emailed=emailed)
                 seen_ids.add(p["id"])
@@ -756,12 +1078,14 @@ def main():
 
     except Exception as e:
         print(f"💥 Critical Failure during monitor run: {e}")
+        raise
     finally:
         try:
             driver.quit()
-        except:
+        except Exception:
             pass
         print("🏁 Expert360 Monitor run complete.")
+
 
 if __name__ == "__main__":
     main()

@@ -8,3 +8,5 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+scrapers/expert360/.chrome_profile/
+**/expert360_cookies.json

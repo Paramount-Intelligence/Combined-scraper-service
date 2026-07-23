@@ -28,6 +28,8 @@ Create a `.env` file at the root directory (based on the template below) or set 
 ```env
 MONGO_URI=your_mongodb_connection_uri
 GROQ_API_KEY=your_groq_api_key
+# Groq model for spreadsheet Category / field extraction (Railway Variables tab too)
+GROQ_CLASSIFICATION_MODEL=openai/gpt-oss-120b
 WEBHOOK_URL=your_google_sheets_webhook_url
 
 SMTP_SERVER=smtp.gmail.com

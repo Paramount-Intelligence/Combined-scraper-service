@@ -23,11 +23,17 @@ if os.path.exists(grandparent_env):
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_CLASSIFICATION_MODEL = os.getenv(
+    "GROQ_CLASSIFICATION_MODEL",
+    "openai/gpt-oss-120b",
+)
 
 # Initialize Groq client
 if not GROQ_API_KEY:
     print("⚠️ WARNING: GROQ_API_KEY is not set in the environment or .env file.")
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+if groq_client:
+    print(f"🤖 Groq classification model: {GROQ_CLASSIFICATION_MODEL}")
 
 # Filter options
 FILTER_ENGLISH_ONLY = os.getenv("FILTER_ENGLISH_ONLY", "True").lower() == "true"
@@ -141,7 +147,7 @@ CATEGORIES = [
     "Program and Project Management",
     "Research and Due Diligence",
     "Corporate Strategy and Development",
-    "Subject Matter Expert"
+    "Subject Matter Expert",
 ]
 
 UNIVERSAL_CATEGORIES = [
@@ -155,8 +161,120 @@ UNIVERSAL_CATEGORIES = [
     "Program and Project Management",
     "Data",
     "Product Management",
-    "General Consulting"
+    "General Consulting",
 ]
+
+# Normalized Category policy for Groq (Platform Category is separate and must not be copied).
+CATEGORY_CLASSIFICATION_POLICY = """
+## Normalized Category Policy (field name: category)
+
+You must set `category` to exactly ONE value from the allowed Category list.
+Never invent a new normalized Category.
+Do not confuse fields:
+- platform_category = source/domain label (may be free-form)
+- category = our normalized internal Category (allowed list only)
+- role_type = employment/engagement type
+- Work Type (Remote/Hybrid/Onsite) is NOT your job here
+
+Title and description carry the most weight. Platform Category / source breadcrumbs are supporting evidence only — do not copy them into `category`.
+
+### Decision order
+1. Identify the primary deliverable or responsibility.
+2. Identify whether the buyer explicitly named a recognized function (Product Management, Project/Program Management, Information Security, Finance, Data, Corporate Strategy, etc.).
+3. Determine whether the consultant is setting direction, managing delivery, performing technical work, conducting research, or providing broad consulting support.
+4. Select the most specific supported category.
+5. Use General Consulting when no other category is clearly supported.
+6. Use Subject Matter Expert only when narrow expertise is the actual service being purchased.
+7. Do not classify based on isolated keywords.
+8. Do not classify based only on the project’s industry.
+9. Do not classify based only on the Platform Category.
+10. Do not return multiple categories.
+
+### General Consulting vs Subject Matter Expert
+Use Subject Matter Expert ONLY when the client is buying narrow, uncommon functional, scientific, technical, regulatory, geographic, or industry expertise outside normal consulting work.
+Examples that may qualify: peptide formulation; satellite licensing regulation; shipping regulation in a specific country; highly specific financial regulations; narrow SAP module expertise where that exact domain is why they are hired; specialized scientific/clinical/engineering/regulatory disciplines.
+Do NOT classify as Subject Matter Expert merely because the title/description contains: expert, SME, specialist, advisor, advisory, subject matter expert, deep expertise, industry expert. Those terms alone are insufficient.
+Use General Consulting for broad/typical consulting that does not clearly fit another category, including: general analysis, team augmentation, requirements gathering, change management (organizational), general business analysis, training support, workshop facilitation, communications support, general transformation support, general consulting roles, analyst roles without a more specific functional category.
+The dataset should contain substantially more General Consulting than Subject Matter Expert.
+When uncertain between SME and General Consulting, select General Consulting.
+
+### Information Technology vs Program and Project Management
+Use Program and Project Management when the buyer explicitly requests: Project Manager, Program Manager, PM, PMO, IT Project Manager, IT Program Manager, Implementation Program Lead, Integration Management Office lead, program governance and delivery management.
+An IT Project Manager remains Program and Project Management even if the project is technology-related.
+Use Information Technology when the primary work involves: cybersecurity, information security, IT/enterprise architecture, infrastructure, cloud, systems engineering, software engineering, technology assessment, technical implementation, systems integration, testing, QA/UAT from a technical perspective, application support, IT operations, ERP configuration/implementation, building/evaluating/securing/operating technology.
+Do not classify a technical role as Program and Project Management merely because it coordinates tasks or stakeholders.
+
+### IT transformation
+Corporate Strategy and Development only when deciding enterprise technology direction (enterprise technology strategy, future-state technology direction, technology investment priorities, enterprise transformation roadmap, build-versus-buy direction, target technology operating model, strategic platform decisions across the enterprise).
+Program and Project Management when technology direction is already selected and the consultant manages implementation.
+Information Technology when designing, assessing, integrating, configuring, securing, testing, or implementing the technology itself.
+
+### Project management in finance
+Finance and Accounting when a project manager must personally bring deep finance/accounting/controllership/audit/treasury/tax/FP&A/financial reporting expertise and that finance knowledge is central.
+Program and Project Management when the person is primarily a general PM coordinating a finance-related initiative.
+Do not use Finance and Accounting merely because Finance is a stakeholder or workstream.
+
+### Product Management
+Follow the buyer’s terminology. Strongly prefer Product Management when the buyer explicitly calls the role: Product Manager, Head of Product, Product Lead, Product Owner, Product Operations, Product Strategy, Product Development Lead.
+Also Product Management when defining product vision, owning roadmap, prioritizing capabilities, building a new tool/platform/application/product, product discovery, connecting customer needs to requirements, product lifecycle decisions.
+Information Technology when primarily technical implementation/configuration/integration/security/support/architecture.
+Program and Project Management when managing delivery without owning product vision/roadmap/product decisions.
+
+### Corporate Strategy and Development
+Use when work sets direction for an enterprise, business unit, major portfolio, carveout, new venture, or transformation: enterprise/corporate/business-unit strategy, new business or market direction, enterprise operating model, carveout strategy, transformation strategy, enterprise capability roadmap, strategic portfolio choices, major build-versus-buy, long-term enterprise technology direction, CEO/CSO mandates.
+Do not use when strategy is already decided and the consultant is executing implementation.
+
+### Research and Due Diligence
+Use for: Voice of the Customer, customer interviews/research, market interviews, primary research, competitive research, commercial/vendor/market due diligence, literature review, benchmarking to answer a defined research question, HEOR when core work is research/evidence generation/health economics/outcomes analysis.
+Start HEOR under Research and Due Diligence; move to Program and Project Management only when primarily managing a large HEOR program rather than conducting/interpreting research.
+
+### Business and functional requirements
+Business/functional requirements are NOT automatically Information Technology.
+Use Business Process and Operations or General Consulting for: business/functional/user requirements gathering, process mapping, workflow documentation, business analysis, current/future-state process analysis, translating stakeholder needs into requirements.
+Use Information Technology only when substantially technical (solution/systems/API/data/security architecture, integration design, technical configuration, software development).
+
+### Change management
+General Consulting for non-technical organizational change management: stakeholder engagement, communications/adoption/sponsorship planning, organizational readiness, behavior change, training/capability building, workforce transition.
+Program and Project Management only when clearly owning the broader program/project rather than only the change workstream.
+Information Technology for IT systems change management: change tickets/requests, release management, ITSM, change control for systems, production changes, deployment governance, technical configuration changes.
+Organizational change management ≠ IT systems change management.
+
+### Data
+Use Data for: data analytics, BI, Power BI, Tableau, Looker, data engineering/science, ML delivery, data architecture, taxonomy/ontology, analytics dashboards, data modeling/pipelines, reporting/insights, AI model development when primarily data science/ML.
+Specific analytics tools such as Power BI normally map to Data.
+
+### Enterprise Architect
+Information Technology for Enterprise/Solution/Technical/Cloud/Application Architect and similar unless strong evidence the person sets enterprise-wide corporate strategy rather than technology architecture.
+Do not classify Enterprise Architect as General Consulting.
+
+### Training
+General Consulting for most training (creation, delivery, learning content, capability building, workshop facilitation, adoption training).
+Program and Project Management when managing a large-scale training program/portfolio/multi-workstream learning rollout but not personally building content.
+Use another category only when training is clearly subordinate to that specialized function.
+
+### Pricing
+GTM (Marketing + Sales) when pricing is part of commercialization, product positioning, route to market, segmentation, promotion, revenue growth, or sales strategy.
+Research and Due Diligence when primarily pricing research, benchmarking, willingness-to-pay analysis, market interviews, or evidence gathering.
+Use the dominant purpose.
+
+### Procurement
+Start procurement, sourcing, supply management, vendor management, purchasing operations, and procurement transformation under Business Process and Operations; move only when clearly supported (e.g. procurement program manager → Program and Project Management; procurement due diligence → Research and Due Diligence).
+
+### Business Analyst
+Title “Business Analyst” alone does not mean Business Process and Operations. Start with General Consulting; move when responsibilities clearly support another category (process mapping → General Consulting or Business Process and Operations; dashboards → Data; product ownership → Product Management; technical systems analysis → Information Technology; finance analysis → Finance and Accounting; program coordination → Program and Project Management).
+
+### Interim executives (defaults, then validate against actual work)
+Interim CEO / Chief Strategy Officer → Corporate Strategy and Development
+Interim CFO → Finance and Accounting
+Interim CMO / CRO → GTM (Marketing + Sales)
+Interim CTO / CIO → Information Technology
+Interim Chief Scientific Officer → General Consulting
+Interim Chief Human Capital / People Officer → Business Process and Operations
+
+### category_reasoning / category_confidence
+Provide a brief 1–2 sentence explanation of the primary responsibilities that drove the choice.
+Set category_confidence between 0.0 and 1.0.
+"""
 
 INDUSTRIES = [
     "Financial Services",
@@ -226,6 +344,179 @@ def sanitize_daily_rate_usd(val: float) -> float:
     print(f"    ⚠️ Daily rate ${val:,.2f} exceeds ${MAX_DAILY_RATE_USD:g}; falling back to ${DEFAULT_DAILY_RATE_USD:g}")
     return DEFAULT_DAILY_RATE_USD
 
+def deterministic_category_fallback(title="", description="", extra_fields=None):
+    """
+    Conservative Category fallback when Groq fails or returns an invalid category.
+    Does not treat expert/SME/advisor/specialist alone as Subject Matter Expert.
+    """
+    extra = extra_fields or {}
+    text = " ".join([
+        str(title or ""),
+        str(description or ""),
+        str(extra.get("industry", "") or ""),
+        str(extra.get("job_type", "") or ""),
+        str(extra.get("skills", "") or ""),
+        str(extra.get("platform_category", "") or ""),
+        str(extra.get("category_path", "") or ""),
+        str(extra.get("breadcrumb", "") or ""),
+    ]).lower()
+
+    # Explicit interim / executive titles
+    if re.search(r"\b(interim\s+)?cfo\b|chief financial officer", text):
+        return "Finance and Accounting"
+    if re.search(r"\b(interim\s+)?(cio|cto)\b|chief information officer|chief technology officer", text):
+        return "Information Technology"
+    if re.search(r"\b(interim\s+)?ceo\b|chief executive officer|chief strategy officer", text):
+        return "Corporate Strategy and Development"
+    if re.search(
+        r"chief marketing officer|chief revenue officer|\b(interim\s+)?cmo\b|\b(interim\s+)?cro\b",
+        text,
+    ):
+        return "GTM (Marketing + Sales)"
+    if re.search(r"chief people officer|chief human capital officer", text):
+        return "Business Process and Operations"
+
+    # Explicit buyer product terminology
+    if re.search(
+        r"\b(head of product|product manager|product lead|product owner|"
+        r"product operations|product strategy|product development lead)\b",
+        text,
+    ):
+        return "Product Management"
+
+    # Program / project management (incl. IT PM) before generic IT
+    if re.search(
+        r"\b(project manager|program manager|programme manager|\bpmo\b|"
+        r"it project manager|it program manager|implementation program lead|"
+        r"integration management office|training program manager)\b",
+        text,
+    ):
+        return "Program and Project Management"
+    if re.search(r"\b(project|program|programme)\s+manager\b|\bit\s*pm\b", text):
+        return "Program and Project Management"
+
+    # Enterprise / technical architects
+    if re.search(
+        r"\b(enterprise|solution|technical|cloud|application|data)\s+architect\b",
+        text,
+    ):
+        return "Information Technology"
+
+    # Data / analytics tools and roles
+    if re.search(
+        r"\b(power\s*bi|tableau|looker|data engineer|data scientist|"
+        r"data analytics|machine learning|data pipeline|business intelligence)\b",
+        text,
+    ):
+        return "Data"
+
+    # Research / diligence
+    if re.search(
+        r"voice of (the )?customer|\bvoc\b|customer interviews|willingness[- ]to[- ]pay|"
+        r"commercial due diligence|vendor due diligence|market diligence|"
+        r"primary research|competitive research|pricing research",
+        text,
+    ):
+        return "Research and Due Diligence"
+
+    # Narrow SME domains only (not generic expert/SME/advisor/specialist keywords)
+    if re.search(r"peptide formulation|satellite (licensing )?regulation|shipping regulation", text):
+        return "Subject Matter Expert"
+
+    # Enterprise technology strategy / direction (not implementation)
+    if re.search(
+        r"technology transformation strategy|enterprise technology (strategy|direction)|"
+        r"future[- ]state technology|technology investment priorit|"
+        r"build[- ]versus[- ]buy|target technology operating model|"
+        r"(enterprise|corporate)\s+(technology\s+)?(strategy|transformation strategy)",
+        text,
+    ) and not re.search(r"\bimplementation\b", text):
+        return "Corporate Strategy and Development"
+
+    # IT security / engineering / systems / ERP / tech implementation (not org change)
+    if re.search(
+        r"\b(cybersecurity|information security|software engineering|cloud|"
+        r"systems integration|erp (configuration|implementation)|"
+        r"\bsap\b|s/?4\s*hana|technical implementation|"
+        r"technology transformation implementation|"
+        r"release management|change tickets?|it service management|"
+        r"change control|deployment governance|technical configuration|"
+        r"it change manager|systems engineering)\b",
+        text,
+    ):
+        return "Information Technology"
+    if re.search(r"\bimplementation (lead|consultant)\b", text) and re.search(
+        r"\b(technology|erp|sap|system|cloud|software)\b", text
+    ):
+        return "Information Technology"
+
+    # Procurement → BPO
+    if re.search(
+        r"\b(procurement|sourcing|supply management|vendor management|"
+        r"purchasing operations|procurement transformation)\b",
+        text,
+    ):
+        return "Business Process and Operations"
+
+    # Pricing: GTM vs research
+    if re.search(r"\bpricing\b", text):
+        if re.search(
+            r"willingness[- ]to[- ]pay|pricing research|benchmarking|market interviews",
+            text,
+        ):
+            return "Research and Due Diligence"
+        if re.search(
+            r"\b(gtm|go[- ]to[- ]market|commerciali[sz]ation|sales strategy|"
+            r"product positioning|revenue growth|route to market)\b",
+            text,
+        ):
+            return "GTM (Marketing + Sales)"
+
+    # Marketing / GTM without treating "expert" as SME
+    if re.search(
+        r"\b(marketing strategy|gtm|go[- ]to[- ]market|sales strategy|"
+        r"commerciali[sz]ation)\b",
+        text,
+    ):
+        return "GTM (Marketing + Sales)"
+
+    return "General Consulting"
+
+
+def resolve_normalized_category(semantics, title="", description="", extra_fields=None):
+    """
+    Prefer Groq's normalized Category when valid; otherwise conservative fallback.
+    Returns (category, reasoning, confidence, source) where source is 'groq' or 'fallback'.
+    """
+    semantics = semantics or {}
+    raw = semantics.get("category")
+    if isinstance(raw, str):
+        candidate = raw.strip()
+    else:
+        candidate = ""
+
+    reasoning = str(semantics.get("category_reasoning") or "").strip()
+    try:
+        confidence = float(semantics.get("category_confidence"))
+    except (TypeError, ValueError):
+        confidence = None
+
+    if candidate in CATEGORIES:
+        if confidence is None:
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+        if not reasoning:
+            reasoning = "Groq returned an allowed Category without reasoning."
+        return candidate, reasoning, confidence, "groq"
+
+    fallback = deterministic_category_fallback(title, description, extra_fields)
+    reason = (
+        f"Groq category invalid or missing ({candidate!r}); "
+        f"deterministic fallback selected {fallback}."
+    )
+    return fallback, reason, 0.0, "fallback"
+
+
 def query_groq_semantics(title, description, extra_fields=None):
     """Call Groq LLM to extract semantic classification and parameters in JSON format."""
     if not groq_client:
@@ -233,7 +524,7 @@ def query_groq_semantics(title, description, extra_fields=None):
 
     system_prompt = f"""You are a data extraction assistant. You will receive a job/project record from a freelance platform. Your job is to classify it and extract structured fields.
 
-Return ONLY a valid JSON object — no markdown, no explanation, no extra text.
+Return ONLY a valid JSON object — no markdown, no explanation outside JSON fields, no chain-of-thought, no extra text.
 
 ---
 
@@ -242,6 +533,8 @@ Return ONLY a valid JSON object — no markdown, no explanation, no extra text.
 {{
   "platform_category": string,
   "category": string,
+  "category_reasoning": string,
+  "category_confidence": number,
   "industry": string,
   "industry_secondary": string,
   "role_type": string,
@@ -261,11 +554,15 @@ Return ONLY a valid JSON object — no markdown, no explanation, no extra text.
 
 For each field (except platform_category), pick exactly one value from the allowed list. Do not invent new values.
 
-- **platform_category** → A short, broad domain/category describing the project (e.g., "Data Analytics", "Finance Modelling", "HR Strategy"). You can pick one of these examples if it fits: {json.dumps(PLATFORM_CATEGORIES)}. If none of the examples fit, you must generate a new descriptive platform category describing the domain (keep it brief and capitalized like the examples). NEVER use "NaN", "None", null, or empty values.
-- **category** → {json.dumps(CATEGORIES)}
+- **platform_category** → A short, broad domain/category describing the project (e.g., "Data Analytics", "Finance Modelling", "HR Strategy"). You can pick one of these examples if it fits: {json.dumps(PLATFORM_CATEGORIES)}. If none of the examples fit, you must generate a new descriptive platform category describing the domain (keep it brief and capitalized like the examples). NEVER use "NaN", "None", null, or empty values. This is NOT the normalized Category field.
+- **category** → exactly one of: {json.dumps(CATEGORIES)}
+- **category_reasoning** → one or two concise sentences based on primary responsibilities (not lengthy analysis).
+- **category_confidence** → number between 0.0 and 1.0
 - **industry** → {json.dumps(INDUSTRIES)}
 - **industry_secondary** → {json.dumps(INDUSTRIES_SECONDARY)}
 - **role_type** → {json.dumps(ROLE_TYPES)}
+
+{CATEGORY_CLASSIFICATION_POLICY}
 
 ---
 
@@ -295,15 +592,44 @@ Note on utilization: Do not confuse on-site/remote/travel requirement percentage
 Explain where the raw values were found (e.g. "Found salary: '£45,000 per annum'").
 """
 
-    record_dump = {k: v for k, v in (extra_fields or {}).items() if k != "_id"}
-    user_content = f"Title: {title}\nDescription: {description}\n\nFull DB record:\n{json.dumps(record_dump, default=str, indent=2)}"
-    
+    extra = extra_fields or {}
+    platform_cat_hint = (
+        extra.get("platform_category")
+        or extra.get("category")
+        or extra.get("industry")
+        or ""
+    )
+    category_path = (
+        extra.get("category_path")
+        or extra.get("breadcrumb")
+        or extra.get("skills")
+        or ""
+    )
+    role_meta = {
+        "job_type": extra.get("job_type"),
+        "engagement_type": extra.get("engagement_type"),
+        "remote_type": extra.get("remote_type"),
+        "location": extra.get("location"),
+        "company": extra.get("company"),
+        "duration": extra.get("duration") or extra.get("project_length"),
+        "budget": extra.get("budget") or extra.get("salary"),
+    }
+    record_dump = {k: v for k, v in extra.items() if k != "_id"}
+    user_content = (
+        f"Title: {title}\n"
+        f"Description: {description}\n"
+        f"Exact Platform Category (source label, supporting evidence only): {platform_cat_hint}\n"
+        f"Source category path or breadcrumb: {category_path}\n"
+        f"Role or employment metadata: {json.dumps(role_meta, default=str)}\n"
+        f"Other relevant structured source fields:\n{json.dumps(record_dump, default=str, indent=2)}"
+    )
+
     max_retries = 7
     retry_delay = 10
     for attempt in range(max_retries):
         try:
             completion = groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model=GROQ_CLASSIFICATION_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content}
@@ -320,6 +646,10 @@ Explain where the raw values were found (e.g. "Found salary: '£45,000 per annum
             curr = result.get("rate_currency")
             per = result.get("rate_period")
             print(f"    🔍 LLM Extracted: {raw_low}-{raw_high} {curr}/{per} | Reasoning: {reasoning}")
+            cat = result.get("category")
+            cat_reason = result.get("category_reasoning", "")
+            cat_conf = result.get("category_confidence", "")
+            print(f"    🏷️ LLM Category: {cat} (confidence={cat_conf}) | {cat_reason}")
             return result
         except Exception as e:
             err_str = str(e).lower()
@@ -513,9 +843,13 @@ def map_record_to_row(project: dict) -> list:
     if not platform_category or platform_category.lower() in ["nan", "none", "null", ""]:
         platform_category = "Support"
 
-    category = semantics.get("category")
-    if category not in CATEGORIES:
-        category = "General Consulting"
+    category, category_reasoning, category_confidence, category_source = resolve_normalized_category(
+        semantics, title, desc, project
+    )
+    print(
+        f"    ✅ Category selected [{category_source}]: {category} "
+        f"(confidence={category_confidence}) | {category_reasoning}"
+    )
 
     industry = semantics.get("industry")
     if industry not in INDUSTRIES:
