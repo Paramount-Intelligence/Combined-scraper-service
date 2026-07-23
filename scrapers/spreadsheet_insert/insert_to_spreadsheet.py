@@ -387,39 +387,63 @@ def determine_work_type(project: dict) -> str:
 
     Soft onsite language (e.g. "occasionally on-site") must not force Onsite when
     the role is primarily remote / hybrid.
+
+    Prefer structured remote_type when unambiguous. ConsultingHeads labels like
+    "Remote/On-Site: Remote" must not count the label's "On-Site" as onsite work.
     """
-    meta = " ".join([
-        str(project.get("location", "")),
-        str(project.get("location_pref", "")),
-        str(project.get("remote_type", "")),
-        str(project.get("job_type", "")),
-    ]).lower()
-    # Description / title / project_length: scrapers (esp. BTG) often bury
-    # "primarily remote" outside structured location fields.
+    remote_type = str(project.get("remote_type", "") or "").strip().lower()
+    location = str(project.get("location", "") or "").strip().lower()
+    location_pref = str(project.get("location_pref", "") or "").strip().lower()
+    job_type = str(project.get("job_type", "") or "").strip().lower()
+
+    def _has_remote(text: str) -> bool:
+        return bool(re.search(
+            r"(?<!\w)(fully\s+)?remote(?!\w)|(?<!\w)wfh(?!\w)|work[\s-]?from[\s-]?home",
+            text,
+        ))
+
+    def _has_strong_onsite(text: str) -> bool:
+        return bool(re.search(r"(?<!\w)(onsite|on-site|on site)(?!\w)", text))
+
+    def _has_soft_onsite(text: str) -> bool:
+        return bool(re.search(
+            r"(occasionally|occasional|rarely|light|limited|potential|minimal)\s+"
+            r"(on[\s-]?site|travel)|"
+            r"(very\s+)?occasional(ly)?\s+(travel|on[\s-]?site)|"
+            r"(light|potential|limited)\s*,?\s*(potential\s+)?travel",
+            text,
+        ))
+
+    # Structured remote_type / location: trust clear values before narrative scan
+    structured = f"{remote_type} {location} {location_pref}".strip()
+    if structured:
+        if "hybrid" in structured:
+            return "Hybrid"
+        struct_remote = _has_remote(structured)
+        struct_soft = _has_soft_onsite(structured)
+        struct_strong = _has_strong_onsite(structured) and not struct_soft
+        if struct_remote and not struct_soft and not struct_strong:
+            return "Remote"
+        if struct_strong and not struct_remote:
+            return "Onsite"
+        if struct_remote and (struct_soft or struct_strong):
+            return "Hybrid"
+
+    meta = " ".join([location, location_pref, remote_type, job_type])
     narrative = " ".join([
-        str(project.get("description", "")),
-        str(project.get("title", "")),
-        str(project.get("project_length", "")),
+        str(project.get("description", "") or ""),
+        str(project.get("title", "") or ""),
+        str(project.get("project_length", "") or ""),
     ]).lower()
+    # Drop field-label "On-Site" in "Remote/On-Site: ..." so only the value counts
+    narrative = re.sub(r"remote\s*/\s*on[\s-]?site\s*:", "remote:", narrative)
+
     all_text = f"{meta} {narrative}"
 
     has_hybrid = "hybrid" in all_text
-    has_remote = any(w in all_text for w in [
-        "remote", "wfh", "work from home", "work-from-home",
-    ])
-    # Occasional / light onsite or travel — not a pure Onsite role
-    has_soft_onsite = bool(re.search(
-        r"(occasionally|occasional|rarely|light|limited|potential|minimal)\s+"
-        r"(on[\s-]?site|travel)|"
-        r"(very\s+)?occasional(ly)?\s+(travel|on[\s-]?site)|"
-        r"(light|potential|limited)\s*,?\s*(potential\s+)?travel",
-        all_text,
-    ))
-    # Strong onsite only when not soft/occasional phrasing
-    has_strong_onsite = bool(re.search(
-        r"(?<!\w)(onsite|on-site|on site)(?!\w)",
-        all_text,
-    )) and not has_soft_onsite
+    has_remote = _has_remote(all_text)
+    has_soft_onsite = _has_soft_onsite(all_text)
+    has_strong_onsite = _has_strong_onsite(all_text) and not has_soft_onsite
 
     if has_hybrid:
         return "Hybrid"
