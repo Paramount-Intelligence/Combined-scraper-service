@@ -35,7 +35,7 @@ SCRAPERS = [
 
 SPREADSHEET_SCRIPT = "scrapers/spreadsheet_insert/insert_to_spreadsheet.py"
 
-def send_status_email(errors, summaries=None):
+def send_status_email(errors, summaries=None, spreadsheet_status=None):
     """Send an SMTP email notification detailing execution status."""
     if not SENDER_EMAIL or not SENDER_PASSWORD:
         print("⚠️ SMTP credentials not set. Cannot send status email alert.")
@@ -62,10 +62,11 @@ def send_status_email(errors, summaries=None):
             status_colors = {
                 "OK": "#5cb85c", "EMPTY": "#f0ad4e", "AUTH_FAIL": "#d9534f",
                 "TIMEOUT": "#d9534f", "MISSING": "#d9534f",
+                "PARTIAL": "#f0ad4e", "RUNTIME_GUARD": "#f0ad4e",
             }
             for name, status, detail in summaries:
                 color = status_colors.get(status, "#d9534f" if status.startswith("EXIT_") else "#999")
-                icon = "&#x2705;" if status == "OK" else "&#x26A0;" if status in ("EMPTY", "AUTH_FAIL") else "&#x274C;"
+                icon = "&#x2705;" if status == "OK" else "&#x26A0;" if status in ("EMPTY", "AUTH_FAIL", "PARTIAL", "RUNTIME_GUARD") else "&#x274C;"
                 detail_short = (detail[:120] + "...") if len(detail) > 120 else detail
                 summary_table += f"""
                     <tr>
@@ -76,11 +77,21 @@ def send_status_email(errors, summaries=None):
                 """
             summary_table += "</tbody></table>"
 
-        if errors:
+        hard_errors = [
+            e for e in (errors or [])
+            if not (isinstance(e, tuple) and len(e) >= 2 and e[1] in (10, 11))
+        ]
+        ss = spreadsheet_status or {}
+        ss_label = ss.get("label", "")
+        ss_detail = ss.get("detail", "")
+
+        if hard_errors:
             msg["Subject"] = f"❌ Scraper Service Failures - {datetime.now().strftime('%Y-%m-%d')}"
             header_color = "#d9534f"
             header_text = "⚠️ Scraper Execution Failures"
             intro_text = "The daily scraper service ran into errors. The following script(s) failed or produced no results:"
+            if ss_label:
+                intro_text += f"<br><br><strong>Spreadsheet:</strong> {ss_label}. {ss_detail}"
 
             table_content = """
             <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
@@ -93,7 +104,7 @@ def send_status_email(errors, summaries=None):
                 </thead>
                 <tbody>
             """
-            for name, code, error_log in errors:
+            for name, code, error_log in hard_errors:
                 snippet = error_log[-1500:] if len(error_log) > 1500 else error_log
                 snippet = snippet.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 table_content += f"""
@@ -104,6 +115,15 @@ def send_status_email(errors, summaries=None):
                     </tr>
                 """
             table_content += "</tbody></table>"
+        elif ss.get("partial"):
+            msg["Subject"] = f"⚠️ Scraper Service Partial Success - {datetime.now().strftime('%Y-%m-%d')}"
+            header_color = "#f0ad4e"
+            header_text = "⚠️ Scraper Execution Partial Success"
+            intro_text = ss_detail or (
+                "Partial success: some spreadsheet rows were inserted; "
+                "remaining AI records were retained for the next run."
+            )
+            table_content = ""
         else:
             msg["Subject"] = f"✅ Scraper Service Success - {datetime.now().strftime('%Y-%m-%d')}"
             header_color = "#5cb85c"
@@ -266,6 +286,7 @@ def main():
 
     # Always run spreadsheet insert script, even if some scrapers failed
     print(f"\n▶️ Running Spreadsheet Insertion Script ({SPREADSHEET_SCRIPT})...")
+    spreadsheet_status = {"partial": False, "label": "", "detail": ""}
     if os.path.exists(SPREADSHEET_SCRIPT):
         cwd = os.path.dirname(SPREADSHEET_SCRIPT)
         script_name = os.path.basename(SPREADSHEET_SCRIPT)
@@ -276,49 +297,123 @@ def main():
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
-                check=True,
-                # Generous limit: ~3s pacing + Groq call (with rate-limit retries)
-                # per record means big days easily exceed 10 minutes.
+                check=False,
+                # Parent hard limit ~3600s; insert script self-guards earlier (~3300s).
                 timeout=3600
             )
-            if result.stdout:
-                for line in result.stdout.splitlines():
+            out = result.stdout or ""
+            err = result.stderr or ""
+            if out:
+                for line in out.splitlines():
                     print(f"  [Spreadsheet] {line}")
-            if result.stderr:
-                for line in result.stderr.splitlines():
+            if err:
+                for line in err.splitlines():
                     print(f"  [Spreadsheet STDERR] {line}")
-            print("✅ Finished Spreadsheet Insertion successfully.")
+
+            run_status_line = ""
+            for line in out.splitlines():
+                if line.startswith("RUN_STATUS="):
+                    run_status_line = line.split("=", 1)[-1].strip()
+
+            code = result.returncode
+            # Exit codes from insert_to_spreadsheet.py:
+            # 0 success, 10 partial, 11 runtime guard, 12 permanent config, 13 webhook
+            if code == 0:
+                print("✅ Finished Spreadsheet Insertion successfully.")
+                scraper_summaries.append(("Spreadsheet Insertion", "OK", run_status_line or "success"))
+                spreadsheet_status = {
+                    "partial": False,
+                    "label": "Completed successfully",
+                    "detail": "All eligible spreadsheet rows were inserted.",
+                }
+            elif code == 10:
+                print("⚠️ Spreadsheet insertion completed with deferred AI records.")
+                scraper_summaries.append(("Spreadsheet Insertion", "PARTIAL", run_status_line or "partial_success"))
+                spreadsheet_status = {
+                    "partial": True,
+                    "label": "Completed with deferred AI records",
+                    "detail": (
+                        "Partial success: some rows were inserted; "
+                        "remaining AI records were retained for the next run."
+                    ),
+                }
+            elif code == 11:
+                print("⚠️ Spreadsheet insertion stopped safely due to runtime guard.")
+                scraper_summaries.append(("Spreadsheet Insertion", "RUNTIME_GUARD", run_status_line or "runtime_guard"))
+                spreadsheet_status = {
+                    "partial": True,
+                    "label": "Stopped safely because runtime limit approached",
+                    "detail": (
+                        "Runtime guard activated: completed rows were flushed; "
+                        "remaining records stay uninserted for the next run."
+                    ),
+                }
+            elif code == 12:
+                detail = "Failed because of permanent Gemini configuration error"
+                print(f"❌ {detail}")
+                execution_errors.append(("Spreadsheet Insertion", code, out + "\n" + err))
+                scraper_summaries.append(("Spreadsheet Insertion", f"EXIT_{code}", detail))
+                spreadsheet_status = {
+                    "partial": False,
+                    "label": detail,
+                    "detail": detail,
+                }
+            elif code == 13:
+                detail = "Failed because spreadsheet webhook rejected a batch"
+                print(f"❌ {detail}")
+                execution_errors.append(("Spreadsheet Insertion", code, out + "\n" + err))
+                scraper_summaries.append(("Spreadsheet Insertion", f"EXIT_{code}", detail))
+                spreadsheet_status = {
+                    "partial": False,
+                    "label": detail,
+                    "detail": detail,
+                }
+            else:
+                print(f"❌ Spreadsheet insertion script failed with exit code {code}.")
+                execution_errors.append(("Spreadsheet Insertion", code, out + "\n" + err))
+                scraper_summaries.append(("Spreadsheet Insertion", f"EXIT_{code}", run_status_line))
+                spreadsheet_status = {
+                    "partial": False,
+                    "label": f"Failed with exit code {code}",
+                    "detail": run_status_line or f"Exit code {code}",
+                }
         except subprocess.TimeoutExpired:
             err_msg = "Spreadsheet insertion timed out after 3600s"
             print(f"❌ {err_msg}")
             execution_errors.append(("Spreadsheet Insertion", -2, err_msg))
-        except subprocess.CalledProcessError as e:
-            print(f"❌ Spreadsheet insertion script failed with exit code {e.returncode}.")
-            output_log = (e.stdout or "") + "\n" + (e.stderr or "")
-            if e.stdout:
-                for line in e.stdout.splitlines()[-20:]:
-                    print(f"  [Spreadsheet] {line}")
-            if e.stderr:
-                for line in e.stderr.splitlines()[-10:]:
-                    print(f"  [Spreadsheet STDERR] {line}")
-            execution_errors.append(("Spreadsheet Insertion", e.returncode, output_log))
+            scraper_summaries.append(("Spreadsheet Insertion", "TIMEOUT", err_msg))
+            spreadsheet_status = {
+                "partial": False,
+                "label": "Timed out",
+                "detail": err_msg,
+            }
     else:
         err_msg = f"Spreadsheet script file not found at {SPREADSHEET_SCRIPT}"
         print(f"❌ {err_msg}")
         execution_errors.append(("Spreadsheet Insertion", -1, err_msg))
+        scraper_summaries.append(("Spreadsheet Insertion", "MISSING", err_msg))
 
     print("\n=========================================")
     print("🏁 Execution Summary")
     print("=========================================")
     print("📧 Sending execution status email...")
-    send_status_email(execution_errors, summaries=scraper_summaries)
+    send_status_email(
+        execution_errors,
+        summaries=scraper_summaries,
+        spreadsheet_status=spreadsheet_status,
+    )
 
-    if execution_errors:
-        # Exit with error status to report failure to Railway logs
+    hard_errors = [
+        e for e in execution_errors
+        if not (isinstance(e, tuple) and len(e) >= 2 and e[1] in (10, 11))
+    ]
+    if hard_errors:
         sys.exit(1)
-    else:
-        print("🎉 Service completed successfully! All tasks completed without errors.")
+    if spreadsheet_status.get("partial"):
+        print("⚠️ Service completed with partial spreadsheet success (deferred/runtime-guard).")
         sys.exit(0)
+    print("🎉 Service completed successfully! All tasks completed without errors.")
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()

@@ -5,9 +5,12 @@ import json
 import time
 import requests
 from datetime import datetime, timedelta
+from typing import Literal, Optional
 from dotenv import load_dotenv
 from pymongo import MongoClient
-from groq import Groq
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, Field, ValidationError
 
 # Ensure UTF-8 output
 if hasattr(sys.stdout, 'reconfigure'):
@@ -22,18 +25,59 @@ if os.path.exists(grandparent_env):
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_CLASSIFICATION_MODEL = os.getenv(
-    "GROQ_CLASSIFICATION_MODEL",
-    "openai/gpt-oss-120b",
-)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_PRIMARY_MODEL = os.getenv("GEMINI_PRIMARY_MODEL", "gemini-3.5-flash-lite")
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash")
+# Backward-compatible alias used by older logs/tests
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", GEMINI_PRIMARY_MODEL)
+ENABLE_MODEL_FALLBACK = os.getenv("ENABLE_MODEL_FALLBACK", "true").lower() == "true"
+CATEGORY_CONFIDENCE_THRESHOLD = float(os.getenv("CATEGORY_CONFIDENCE_THRESHOLD", "0.70"))
+AI_ATTEMPTS_PER_MODEL = int(os.getenv("AI_ATTEMPTS_PER_MODEL", "2"))
+AI_REQUEST_DELAY_SECONDS = float(os.getenv("AI_REQUEST_DELAY_SECONDS", "2"))
+RECORD_RETRY_ROUNDS = int(os.getenv("RECORD_RETRY_ROUNDS", "2"))
+SPREADSHEET_CHUNK_SIZE = int(os.getenv("SPREADSHEET_CHUNK_SIZE", "5"))
+MAX_RUN_SECONDS = int(os.getenv("MAX_RUN_SECONDS", "3300"))
+SHUTDOWN_RESERVE_SECONDS = int(os.getenv("SHUTDOWN_RESERVE_SECONDS", "180"))
+GEMINI_TIMEOUT_MS = int(os.getenv("GEMINI_TIMEOUT_MS", "90000"))
+RETRY_PENDING_MAX_AGE_DAYS = int(os.getenv("RETRY_PENDING_MAX_AGE_DAYS", "30"))
+# Repository-owned retries only (SDK auto-retries minimized via attempts=1)
+CHUNK_SIZE = SPREADSHEET_CHUNK_SIZE
 
-# Initialize Groq client
-if not GROQ_API_KEY:
-    print("⚠️ WARNING: GROQ_API_KEY is not set in the environment or .env file.")
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-if groq_client:
-    print(f"🤖 Groq classification model: {GROQ_CLASSIFICATION_MODEL}")
+# Initialize Gemini client.
+# Retry ownership: this module performs explicit per-model attempts (AI_ATTEMPTS_PER_MODEL).
+# SDK automatic retries are minimized to attempts=1 to avoid stacked retry storms.
+if not GEMINI_API_KEY:
+    print("⚠️ WARNING: GEMINI_API_KEY is not set.")
+gemini_client = None
+if GEMINI_API_KEY:
+    gemini_client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(
+            timeout=GEMINI_TIMEOUT_MS,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
+if gemini_client:
+    print(
+        f"🤖 Gemini primary={GEMINI_PRIMARY_MODEL} "
+        f"fallback={GEMINI_FALLBACK_MODEL} "
+        f"(fallback_enabled={ENABLE_MODEL_FALLBACK})"
+    )
+
+
+class AIClassificationError(Exception):
+    """Raised when Gemini cannot produce usable semantics for a record."""
+
+    def __init__(self, message, permanent=False):
+        super().__init__(message)
+        self.permanent = bool(permanent)
+
+
+class PermanentGeminiConfigError(AIClassificationError):
+    """API key / billing / schema configuration failure — stop the run."""
+
+    def __init__(self, message):
+        super().__init__(message, permanent=True)
 
 # Filter options
 FILTER_ENGLISH_ONLY = os.getenv("FILTER_ENGLISH_ONLY", "True").lower() == "true"
@@ -164,7 +208,7 @@ UNIVERSAL_CATEGORIES = [
     "General Consulting",
 ]
 
-# Normalized Category policy for Groq (Platform Category is separate and must not be copied).
+# Normalized Category policy for Gemini (Platform Category is separate and must not be copied).
 CATEGORY_CLASSIFICATION_POLICY = """
 ## Normalized Category Policy (field name: category)
 
@@ -328,6 +372,99 @@ INDUSTRIES_SECONDARY = [
 
 ROLE_TYPES = ["Consultant", "Interim/Temporary", "OTHER"]
 
+CategoryValue = Literal[
+    "Business Process and Operations",
+    "Data",
+    "Finance and Accounting",
+    "General Consulting",
+    "GTM (Marketing + Sales)",
+    "Information Technology",
+    "Product Management",
+    "Program and Project Management",
+    "Research and Due Diligence",
+    "Corporate Strategy and Development",
+    "Subject Matter Expert",
+]
+
+RoleTypeValue = Literal[
+    "Consultant",
+    "Interim/Temporary",
+    "OTHER",
+]
+
+RateCurrencyValue = Literal["USD", "GBP", "EUR"]
+
+RatePeriodValue = Literal["hourly", "daily", "monthly", "annually"]
+
+IndustryValue = Literal[
+    "Financial Services",
+    "Energy",
+    "Materials",
+    "Capital Goods",
+    "Commercial & Professional Services",
+    "Transportation",
+    "Automotive",
+    "Consumer Durables and Apparel",
+    "Consumer Goods - Other",
+    "Consumer Services",
+    "Distribution",
+    "Retail",
+    "Healthcare Equipment and Svcs",
+    "Pharma, BioTech, Life Sciences",
+    "Banking",
+    "Insurance",
+    "Software and Services",
+    "Technology Hardware",
+    "Semiconductors and Equipment",
+    "Telecommunications",
+    "Media & Entertainment",
+    "Utilities",
+    "Real Estate Investment",
+    "Real Estate Mgt and Dev",
+    "OTHER",
+    "Manufacturing",
+    "Airlines & Aviation",
+    "Technology",
+    "Healthcare",
+    "Industrials",
+    "Public Sector",
+]
+
+IndustrySecondaryValue = Literal[
+    "Energy",
+    "Pharma, BioTech, Life Sciences",
+    "Consumer Goods - Other",
+    "Software and Services",
+    "Financial Services",
+    "Retail",
+    "Healthcare Equipment and Svcs",
+    "Consumer Services",
+    "Banking",
+    "Utilities",
+    "Capital Goods",
+    "Insurance",
+    "Materials",
+]
+
+
+class ProjectSemantics(BaseModel):
+    platform_category: str
+    category: CategoryValue
+    category_reasoning: str
+    category_confidence: float = Field(ge=0.0, le=1.0)
+    industry: IndustryValue
+    industry_secondary: IndustrySecondaryValue
+    role_type: RoleTypeValue
+    raw_rate_low: Optional[float] = None
+    raw_rate_high: Optional[float] = None
+    rate_currency: Optional[RateCurrencyValue] = None
+    rate_period: Optional[RatePeriodValue] = None
+    duration_months_low: float
+    duration_months_high: float
+    utilization: float
+    daily_rate_reasoning: str
+
+
 # Hard ceiling for consulting/freelance daily rates written to the spreadsheet (USD).
 MAX_DAILY_RATE_USD = 2500.0
 DEFAULT_DAILY_RATE_USD = 799.0
@@ -344,9 +481,67 @@ def sanitize_daily_rate_usd(val: float) -> float:
     print(f"    ⚠️ Daily rate ${val:,.2f} exceeds ${MAX_DAILY_RATE_USD:g}; falling back to ${DEFAULT_DAILY_RATE_USD:g}")
     return DEFAULT_DAILY_RATE_USD
 
+
+def extract_source_platform_category(project: dict) -> str:
+    """Return exact source Platform Category from scraped Mongo fields when present."""
+    possible_fields = [
+        "source_platform_category",
+        "platform_category",
+        "source_category",
+        "project_category",
+        "job_category",
+        "functional_area",
+        "category_path",
+        "breadcrumb",
+        "category",
+    ]
+    invalid_values = {"", "nan", "none", "null", "n/a"}
+    for field in possible_fields:
+        value = project.get(field)
+        if value is None:
+            continue
+        normalized = str(value).strip()
+        if normalized and normalized.lower() not in invalid_values:
+            return normalized
+    return ""
+
+
+def build_curated_record_dump(extra: dict) -> dict:
+    """Compact metadata payload for Gemini — excludes empty values and full Mongo docs."""
+    raw = {
+        "platform": extra.get("platform"),
+        "source_platform_category": extract_source_platform_category(extra),
+        "category_path": extra.get("category_path"),
+        "breadcrumb": extra.get("breadcrumb"),
+        "job_type": extra.get("job_type"),
+        "engagement_type": extra.get("engagement_type"),
+        "placement_type": extra.get("placement_type"),
+        "contract_type": extra.get("contract_type"),
+        "remote_type": extra.get("remote_type"),
+        "location": extra.get("location"),
+        "location_pref": extra.get("location_pref"),
+        "project_length": extra.get("project_length"),
+        "duration": extra.get("duration"),
+        "rate": extra.get("rate"),
+        "salary": extra.get("salary"),
+        "budget": extra.get("budget"),
+        "skills": extra.get("skills"),
+    }
+    cleaned = {}
+    for key, value in raw.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, (list, dict)) and not value:
+            continue
+        cleaned[key] = value
+    return cleaned
+
+
 def deterministic_category_fallback(title="", description="", extra_fields=None):
     """
-    Conservative Category fallback when Groq fails or returns an invalid category.
+    Conservative Category fallback when Gemini fails or returns an invalid category.
     Does not treat expert/SME/advisor/specialist alone as Subject Matter Expert.
     """
     extra = extra_fields or {}
@@ -485,8 +680,8 @@ def deterministic_category_fallback(title="", description="", extra_fields=None)
 
 def resolve_normalized_category(semantics, title="", description="", extra_fields=None):
     """
-    Prefer Groq's normalized Category when valid; otherwise conservative fallback.
-    Returns (category, reasoning, confidence, source) where source is 'groq' or 'fallback'.
+    Prefer Gemini's normalized Category when valid; otherwise conservative fallback.
+    Returns (category, reasoning, confidence, source) where source is 'gemini' or 'fallback'.
     """
     semantics = semantics or {}
     raw = semantics.get("category")
@@ -506,47 +701,136 @@ def resolve_normalized_category(semantics, title="", description="", extra_field
             confidence = 0.0
         confidence = max(0.0, min(1.0, confidence))
         if not reasoning:
-            reasoning = "Groq returned an allowed Category without reasoning."
-        return candidate, reasoning, confidence, "groq"
+            reasoning = "Gemini returned an allowed Category without reasoning."
+        return candidate, reasoning, confidence, "gemini"
 
     fallback = deterministic_category_fallback(title, description, extra_fields)
     reason = (
-        f"Groq category invalid or missing ({candidate!r}); "
+        f"Gemini category invalid or missing ({candidate!r}); "
         f"deterministic fallback selected {fallback}."
     )
     return fallback, reason, 0.0, "fallback"
 
 
-def query_groq_semantics(title, description, extra_fields=None):
-    """Call Groq LLM to extract semantic classification and parameters in JSON format."""
-    if not groq_client:
-        return {}
+def resolve_platform_category(project: dict, semantics: dict):
+    """
+    Catalant: keep exact scraped Platform Category (never overwrite with Gemini).
+    Other platforms: use Gemini-generated Platform Category.
+    Returns (platform_category, source_label).
+    """
+    semantics = semantics or {}
+    db_platform = str(project.get("platform", "") or "").strip().lower()
+    gemini_platform_category = str(semantics.get("platform_category") or "").strip()
 
+    if db_platform == "catalant":
+        source_platform_category = extract_source_platform_category(project)
+        if source_platform_category:
+            return source_platform_category, "catalant_source"
+        print(
+            "    ⚠️ Catalant source Platform Category "
+            "was not captured. Using Unclassified."
+        )
+        return "Unclassified", "missing_catalant_source"
+
+    if gemini_platform_category and gemini_platform_category.lower() not in {
+        "nan", "none", "null", "",
+    }:
+        return gemini_platform_category, "gemini"
+    return "Unclassified", "fallback"
+
+
+def _is_permanent_gemini_error(error: Exception) -> bool:
+    err_str = str(error).lower()
+    permanent_markers = (
+        "invalid api key",
+        "api key not valid",
+        "permission denied",
+        "unauthenticated",
+        "unauthorized",
+        "forbidden",
+        "billing",
+        "invalid argument",
+        "invalid_argument",
+        "unsupported parameter",
+        "unsupported schema",
+        "missing gemini_api_key",
+        "gemini_api_key is not set",
+    )
+    if any(m in err_str for m in permanent_markers):
+        return True
+    if any(code in err_str for code in ("401", "403", "400")) and not any(
+        code in err_str for code in ("429", "500", "502", "503", "504")
+    ):
+        return True
+    return False
+
+
+def _is_transient_gemini_error(error: Exception) -> bool:
+    if _is_permanent_gemini_error(error):
+        return False
+    if isinstance(error, ValidationError):
+        return True
+    err_str = str(error).lower()
+    err_type = type(error).__name__.lower()
+    transient_markers = (
+        "429",
+        "resource_exhausted",
+        "resource exhausted",
+        "500",
+        "502",
+        "503",
+        "504",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection aborted",
+        "temporarily unavailable",
+        "temporary",
+        "unavailable",
+        "deadline exceeded",
+        "internal",
+        "empty response",
+        "invalid category",
+        "schema validation",
+        "failed projectsemantics",
+        "validation",
+    )
+    if any(m in err_str for m in transient_markers):
+        return True
+    if "server" in err_type or "timeout" in err_type or "unavailable" in err_type:
+        return True
+    return False
+
+
+def _gemini_retry_wait_seconds(error: Exception, attempt: int) -> float:
+    """Prefer server-provided retry delay; else capped exponential backoff."""
+    for attr in ("retry_delay", "retry_after", "retry_after_seconds"):
+        val = getattr(error, attr, None)
+        if val is None:
+            continue
+        try:
+            if hasattr(val, "total_seconds"):
+                secs = float(val.total_seconds())
+            else:
+                secs = float(val)
+            if secs > 0:
+                return min(secs, 90.0)
+        except (TypeError, ValueError):
+            pass
+    err_str = str(error)
+    m = re.search(r"retry[_ ]?delay[\"'=\s:]*([0-9]+(?:\.[0-9]+)?)s?", err_str, re.I)
+    if m:
+        try:
+            return min(float(m.group(1)), 90.0)
+        except ValueError:
+            pass
+    return float(min(15 * (2 ** attempt), 90))
+
+
+def _build_semantics_prompts(title, description, extra_fields=None):
     system_prompt = f"""You are a data extraction assistant. You will receive a job/project record from a freelance platform. Your job is to classify it and extract structured fields.
 
-Return ONLY a valid JSON object — no markdown, no explanation outside JSON fields, no chain-of-thought, no extra text.
-
----
-
-## Output Schema
-
-{{
-  "platform_category": string,
-  "category": string,
-  "category_reasoning": string,
-  "category_confidence": number,
-  "industry": string,
-  "industry_secondary": string,
-  "role_type": string,
-  "raw_rate_low": number or null,
-  "raw_rate_high": number or null,
-  "rate_currency": string or null ("USD", "GBP", "EUR", or null),
-  "rate_period": string or null ("hourly", "daily", "monthly", "annually", or null),
-  "duration_months_low": number,
-  "duration_months_high": number,
-  "utilization": number,
-  "daily_rate_reasoning": string
-}}
+Return ONLY a valid JSON object matching the required schema — no markdown, no explanation outside JSON fields, no chain-of-thought, no extra text.
 
 ---
 
@@ -591,91 +875,179 @@ Note on utilization: Do not confuse on-site/remote/travel requirement percentage
 ## daily_rate_reasoning
 Explain where the raw values were found (e.g. "Found salary: '£45,000 per annum'").
 """
-
     extra = extra_fields or {}
-    platform_cat_hint = (
-        extra.get("platform_category")
-        or extra.get("category")
-        or extra.get("industry")
-        or ""
-    )
-    category_path = (
-        extra.get("category_path")
-        or extra.get("breadcrumb")
-        or extra.get("skills")
-        or ""
-    )
-    role_meta = {
-        "job_type": extra.get("job_type"),
-        "engagement_type": extra.get("engagement_type"),
-        "remote_type": extra.get("remote_type"),
-        "location": extra.get("location"),
-        "company": extra.get("company"),
-        "duration": extra.get("duration") or extra.get("project_length"),
-        "budget": extra.get("budget") or extra.get("salary"),
-    }
-    record_dump = {k: v for k, v in extra.items() if k != "_id"}
+    record_dump = build_curated_record_dump(extra)
+    source_platform = str(extra.get("platform") or "").strip()
+    source_pc = extract_source_platform_category(extra)
     user_content = (
         f"Title: {title}\n"
         f"Description: {description}\n"
-        f"Exact Platform Category (source label, supporting evidence only): {platform_cat_hint}\n"
-        f"Source category path or breadcrumb: {category_path}\n"
-        f"Role or employment metadata: {json.dumps(role_meta, default=str)}\n"
-        f"Other relevant structured source fields:\n{json.dumps(record_dump, default=str, indent=2)}"
+        f"Source platform: {source_platform}\n"
+        f"Exact source Platform Category: {source_pc}\n"
+        f"Source category breadcrumb: {extra.get('category_path') or extra.get('breadcrumb') or ''}\n"
+        f"Relevant employment / location / duration / rate metadata:\n"
+        f"{json.dumps(record_dump, default=str, indent=2)}"
     )
+    return system_prompt, user_content
 
-    max_retries = 7
-    retry_delay = 10
-    for attempt in range(max_retries):
+
+def call_gemini_model(model_name: str, system_prompt: str, user_content: str) -> dict:
+    """
+    Call one Gemini model once (caller owns retries).
+    Validates structured JSON via ProjectSemantics and allowed CATEGORIES.
+    """
+    if not gemini_client:
+        raise PermanentGeminiConfigError("GEMINI_API_KEY is not set.")
+
+    print(f"    🤖 Calling Gemini model: {model_name}")
+    use_thinking = True
+    last_error = None
+    for thinking_try in range(2):
         try:
-            completion = groq_client.chat.completions.create(
-                model=GROQ_CLASSIFICATION_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0
+            config_kwargs = {
+                "system_instruction": system_prompt,
+                "response_mime_type": "application/json",
+                "response_schema": ProjectSemantics,
+            }
+            if use_thinking:
+                config_kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinking_level=types.ThinkingLevel.MINIMAL,
+                )
+            response = gemini_client.models.generate_content(
+                model=model_name,
+                contents=user_content,
+                config=types.GenerateContentConfig(**config_kwargs),
             )
-            raw = completion.choices[0].message.content
-            result = json.loads(raw)
-            reasoning = result.get("daily_rate_reasoning", "No reasoning provided.")
 
-            raw_low = result.get("raw_rate_low")
-            raw_high = result.get("raw_rate_high")
-            curr = result.get("rate_currency")
-            per = result.get("rate_period")
-            print(f"    🔍 LLM Extracted: {raw_low}-{raw_high} {curr}/{per} | Reasoning: {reasoning}")
-            cat = result.get("category")
-            cat_reason = result.get("category_reasoning", "")
-            cat_conf = result.get("category_confidence", "")
-            print(f"    🏷️ LLM Category: {cat} (confidence={cat_conf}) | {cat_reason}")
+            usage = getattr(response, "usage_metadata", None)
+            if usage:
+                print(
+                    f"    📊 Gemini usage: "
+                    f"input={getattr(usage, 'prompt_token_count', None)}, "
+                    f"output={getattr(usage, 'candidates_token_count', None)}, "
+                    f"total={getattr(usage, 'total_token_count', None)}"
+                )
+
+            if not getattr(response, "text", None):
+                raise ValueError("Gemini returned an empty response.")
+
+            try:
+                parsed = ProjectSemantics.model_validate_json(response.text)
+            except ValidationError as ve:
+                print("    ⚠️ Gemini response failed ProjectSemantics validation.")
+                raise ve
+
+            result = parsed.model_dump()
+            category = str(result.get("category") or "").strip()
+            if category not in CATEGORIES:
+                raise ValueError(f"Invalid Category returned by the model: {category!r}")
+
+            result["_gemini_model"] = model_name
+            print(
+                f"    🔍 Gemini Extracted: {result.get('raw_rate_low')}-{result.get('raw_rate_high')} "
+                f"{result.get('rate_currency')}/{result.get('rate_period')} | "
+                f"Reasoning: {result.get('daily_rate_reasoning', '')}"
+            )
+            print(
+                f"    🏷️ Gemini Category: {category} "
+                f"(confidence={result.get('category_confidence')}) | "
+                f"{result.get('category_reasoning', '')}"
+            )
             return result
         except Exception as e:
-            err_str = str(e).lower()
-            err_type = type(e).__name__.lower()
-            is_rate_limit = (
-                "rate_limit" in err_str or "429" in str(e) or
-                "limit reached" in err_str or "too many requests" in err_str or
-                "ratelimit" in err_type or "rate" in err_type
-            )
-            is_transient = (
-                is_rate_limit or "503" in str(e) or "502" in str(e) or
-                "service unavailable" in err_str or "connection" in err_str or
-                "timeout" in err_str or "server" in err_type
-            )
-            if is_transient:
-                wait_time = retry_delay * (2 ** attempt)
-                # Cap at 120s to stay within orchestrator timeout budget
-                wait_time = min(wait_time, 120)
-                label = "rate limit" if is_rate_limit else "transient error"
-                print(f"    ⚠️ Groq {label} (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s... error: {e}")
+            last_error = e
+            err_l = str(e).lower()
+            if use_thinking and thinking_try == 0 and ("thinking" in err_l or "unsupported" in err_l):
+                print(f"    ⚠️ Gemini thinking config unsupported; retrying without it: {e}")
+                use_thinking = False
+                continue
+            raise
+    raise last_error or RuntimeError("Gemini call failed")
+
+
+def _call_model_with_bounded_attempts(model_name, system_prompt, user_content):
+    """Up to AI_ATTEMPTS_PER_MODEL controlled attempts for one model."""
+    last_error = None
+    for attempt in range(AI_ATTEMPTS_PER_MODEL):
+        try:
+            return call_gemini_model(model_name, system_prompt, user_content)
+        except Exception as e:
+            last_error = e
+            if _is_permanent_gemini_error(e):
+                raise PermanentGeminiConfigError(str(e)) from e
+            if attempt < AI_ATTEMPTS_PER_MODEL - 1 and _is_transient_gemini_error(e):
+                wait_time = _gemini_retry_wait_seconds(e, attempt)
+                print(
+                    f"    ⚠️ Gemini transient error on {model_name} "
+                    f"(attempt {attempt + 1}/{AI_ATTEMPTS_PER_MODEL}). "
+                    f"Retrying in {wait_time}s: {e}"
+                )
                 time.sleep(wait_time)
-            else:
-                print(f"    ⚠️ Groq API call failed (non-retryable): {e}")
-                return {}
-    print(f"    ⚠️ Groq API retries exhausted after {max_retries} attempts. Using defaults.")
-    return {}
+                continue
+            break
+    raise last_error or AIClassificationError(f"{model_name} failed")
+
+
+def query_gemini_semantics(title, description, extra_fields=None, prefer_fallback=False):
+    """
+    Primary/fallback Gemini classification.
+    Raises AIClassificationError when both models fail (no silent empty defaults).
+    """
+    if not gemini_client:
+        raise PermanentGeminiConfigError("GEMINI_API_KEY is not set.")
+
+    system_prompt, user_content = _build_semantics_prompts(title, description, extra_fields)
+    primary = GEMINI_PRIMARY_MODEL
+    fallback = GEMINI_FALLBACK_MODEL
+
+    if prefer_fallback:
+        order = [fallback]
+        if ENABLE_MODEL_FALLBACK and primary != fallback:
+            order.append(primary)
+    else:
+        order = [primary]
+        if ENABLE_MODEL_FALLBACK and fallback != primary:
+            order.append(fallback)
+
+    last_error = None
+    for idx, model_name in enumerate(order):
+        try:
+            result = _call_model_with_bounded_attempts(model_name, system_prompt, user_content)
+            confidence = float(result.get("category_confidence") or 0.0)
+            # On first-pass primary only: escalate low confidence to fallback
+            if (
+                not prefer_fallback
+                and idx == 0
+                and model_name == primary
+                and ENABLE_MODEL_FALLBACK
+                and len(order) > 1
+                and confidence < CATEGORY_CONFIDENCE_THRESHOLD
+            ):
+                print(
+                    f"    ⚠️ Primary Category confidence {confidence:.2f} is below "
+                    f"{CATEGORY_CONFIDENCE_THRESHOLD:.2f}"
+                )
+                print(f"    🔁 Escalating record to {fallback}")
+                try:
+                    return _call_model_with_bounded_attempts(fallback, system_prompt, user_content)
+                except Exception as fb_err:
+                    print(f"    ⚠️ Fallback escalation failed ({fb_err}); keeping primary result")
+                    return result
+            return result
+        except PermanentGeminiConfigError:
+            raise
+        except Exception as e:
+            last_error = e
+            if idx < len(order) - 1:
+                print(f"    ⚠️ Model failed for record: {e}")
+                print(f"    🔁 Switching to fallback model: {order[idx + 1]}")
+                continue
+            break
+
+    raise AIClassificationError(
+        f"Both Gemini models failed: {last_error}"
+    ) from last_error
+
 
 def extract_country_or_na(project: dict) -> str:
     """Extract normalized country or N/A for remote jobs based on location fields."""
@@ -789,15 +1161,18 @@ def determine_work_type(project: dict) -> str:
         return "Hybrid"
     return "Hybrid"
 
-def map_record_to_row(project: dict) -> list:
-    """Build spreadsheet row list from deterministic and semantic LLM logic."""
+def map_record_to_row(project: dict, prefer_fallback: bool = False) -> list:
+    """Build spreadsheet row list from deterministic and semantic Gemini logic.
+
+    Raises AIClassificationError when Gemini cannot classify the record.
+    """
     # 1. Deterministic/Metadata parsing
     detected_at_str = project.get("detected_at", "")
     try:
         dt = datetime.strptime(detected_at_str, "%Y-%m-%d %H:%M:%S")
         scan_datetime = dt.strftime("%m/%d/%Y %H:%M:%S")
         week_num = dt.isocalendar()[1]
-    except:
+    except Exception:
         scan_datetime = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
         week_num = datetime.now().isocalendar()[1]
 
@@ -820,7 +1195,7 @@ def map_record_to_row(project: dict) -> list:
                 elif "month" in unit:
                     est_dt = now - timedelta(days=val*30)
                 posted_date_est = est_dt.strftime("%m/%d/%Y")
-        except:
+        except Exception:
             pass
     if not posted_date_est:
         posted_date_est = datetime.now().strftime("%m/%d/%Y")
@@ -831,17 +1206,23 @@ def map_record_to_row(project: dict) -> list:
     # Location cleaning
     clean_loc = extract_country_or_na(project)
 
-    # 2. Call Groq for Semantic Classifications and Extraction
+    # 2. Call Gemini for Semantic Classifications and Extraction
     title = project.get("title", "")
     desc = project.get("description", "")
-    semantics = query_groq_semantics(title, desc, project)
+    semantics = query_gemini_semantics(
+        title, desc, project, prefer_fallback=prefer_fallback
+    )
+    model_used = semantics.pop("_gemini_model", None)
+    if model_used:
+        print(f"    📌 Classification model used: {model_used}")
+        project["_last_gemini_model"] = model_used
 
-    # Apply defaults if LLM did not return values or failed
-    platform_category = semantics.get("platform_category")
-    if platform_category:
-        platform_category = str(platform_category).strip()
-    if not platform_category or platform_category.lower() in ["nan", "none", "null", ""]:
-        platform_category = "Support"
+    platform_category, platform_category_source = resolve_platform_category(project, semantics)
+    print(
+        f"    🗂️ Platform Category selected "
+        f"[{platform_category_source}]: "
+        f"{platform_category}"
+    )
 
     category, category_reasoning, category_confidence, category_source = resolve_normalized_category(
         semantics, title, desc, project
@@ -980,25 +1361,83 @@ def map_record_to_row(project: dict) -> list:
     ]
     return row
 
-# Send/mark progress every N mapped rows so a timeout or crash only loses the
-# current chunk instead of the whole run.
-CHUNK_SIZE = 20
-
-# Default lookback window (days). Old orphans beyond this are never picked up.
+# Default lookback window (days). Old orphans beyond this are never picked up
+# unless they carry ai_classification_status=retry_pending within the retry age.
 LOOKBACK_DAYS = 3
 
-def flush_chunk(collection, rows, ids, skipped_ids):
-    """Post mapped rows to the webhook and mark all processed ids in MongoDB.
+# Exit codes for run_all / Railway
+EXIT_SUCCESS = 0
+EXIT_PARTIAL_SUCCESS = 10
+EXIT_RUNTIME_GUARD = 11
+EXIT_PERMANENT_CONFIG = 12
+EXIT_WEBHOOK_FAILURE = 13
 
-    Returns True if progress was saved (or nothing to send), False on webhook
-    failure (flags left untouched so records are retried next run).
+
+def runtime_limit_approaching(run_started_at: float) -> bool:
+    elapsed = time.monotonic() - run_started_at
+    return elapsed >= (MAX_RUN_SECONDS - SHUTDOWN_RESERVE_SECONDS)
+
+
+def _safe_error_message(error) -> str:
+    msg = str(error or "")
+    msg = re.sub(r"(api[_-]?key|authorization|bearer)\s*[:=]\s*\S+", r"\1=[REDACTED]", msg, flags=re.I)
+    return msg[:500]
+
+
+def save_retry_failure(collection, record, error):
+    """Persist non-secret AI retry metadata; leave inserted_to_sheet untouched."""
+    try:
+        collection.update_one(
+            {"_id": record["_id"]},
+            {
+                "$set": {
+                    "ai_classification_status": "retry_pending",
+                    "ai_last_error": _safe_error_message(error),
+                    "ai_last_attempt_at": datetime.utcnow(),
+                    "ai_last_primary_model": GEMINI_PRIMARY_MODEL,
+                    "ai_last_fallback_model": GEMINI_FALLBACK_MODEL,
+                },
+                "$inc": {"ai_retry_count": 1},
+            },
+        )
+    except Exception as e:
+        print(f"    ⚠️ Failed to save retry metadata: {e}")
+
+
+def mark_ai_retry_success(collection, record):
+    try:
+        collection.update_one(
+            {"_id": record["_id"]},
+            {
+                "$set": {
+                    "ai_classification_status": "completed",
+                    "ai_last_error": None,
+                    "ai_completed_at": datetime.utcnow(),
+                }
+            },
+        )
+    except Exception as e:
+        print(f"    ⚠️ Failed to clear retry metadata: {e}")
+
+
+def flush_pending_successes(collection, pending_rows, pending_success_ids, skipped_ids=None) -> bool:
     """
-    if rows:
-        print(f"🚀 Sending chunk of {len(rows)} row(s) to webhook...")
+    Post only buffered successful rows. Mark only those IDs (+ intentional skips)
+    after webhook HTTP success. Leave buffers intact on failure.
+    """
+    skipped_ids = skipped_ids if skipped_ids is not None else []
+    if not pending_rows and not skipped_ids:
+        return True
+
+    if pending_rows:
+        print(f"🚀 Sending chunk of {len(pending_rows)} row(s) to webhook...")
         try:
-            response = requests.post(WEBHOOK_URL, json={"rows": rows}, timeout=60)
+            response = requests.post(WEBHOOK_URL, json={"rows": pending_rows}, timeout=60)
             if response.status_code != 200:
-                print(f"    ❌ Webhook returned unexpected status/body: {response.status_code} - {response.text}")
+                print(
+                    f"    ❌ Webhook returned unexpected status/body: "
+                    f"{response.status_code} - {response.text}"
+                )
                 print("    ⚠️ MongoDB flags left untouched for this chunk.")
                 return False
             print("    ✅ Webhook accepted the chunk.")
@@ -1007,21 +1446,59 @@ def flush_chunk(collection, rows, ids, skipped_ids):
             print("    ⚠️ MongoDB flags left untouched for this chunk.")
             return False
 
-    all_ids = ids + skipped_ids
+    all_ids = list(pending_success_ids) + list(skipped_ids)
     if all_ids:
+        now = datetime.utcnow()
         collection.update_many(
             {"_id": {"$in": all_ids}},
-            {"$set": {"inserted_to_sheet": True}}
+            {
+                "$set": {
+                    "inserted_to_sheet": True,
+                    "ai_classification_status": "completed",
+                    "ai_last_error": None,
+                    "ai_completed_at": now,
+                }
+            },
         )
         print(f"    💾 Marked {len(all_ids)} record(s) as inserted in MongoDB.")
+
+    pending_rows.clear()
+    pending_success_ids.clear()
+    skipped_ids.clear()
     return True
 
+
+# Backward-compatible alias
+def flush_chunk(collection, rows, ids, skipped_ids):
+    return flush_pending_successes(collection, rows, ids, skipped_ids)
+
+
 def process_uninserted_records():
-    """Main pipeline loop: pull new records, map, post to webhook in chunks."""
+    """Main pipeline: classify, flush on success/failure, deferred retry, runtime guard."""
+    run_started_at = time.monotonic()
+    run_status = "success"
+    stats = {
+        "loaded": 0,
+        "inserted_first_pass": 0,
+        "primary_successes": 0,
+        "fallback_successes": 0,
+        "deferred": 0,
+        "deferred_retry_successes": 0,
+        "still_pending": 0,
+        "webhook_failures": 0,
+        "skipped_non_english": 0,
+        "runtime_guard": False,
+    }
+
     print("🔌 Connecting to MongoDB...")
     client = MongoClient(MONGO_URI)
     db = client["office_monitor"]
     collection = db["projects"]
+
+    if not GEMINI_API_KEY or gemini_client is None:
+        print("RUN_STATUS=permanent_config")
+        print("❌ GEMINI_API_KEY missing — aborting without silent defaults.")
+        sys.exit(EXIT_PERMANENT_CONFIG)
 
     # Allow target date to be specified as command-line argument
     if len(sys.argv) > 1:
@@ -1030,78 +1507,266 @@ def process_uninserted_records():
             print("📅 Processing ALL uninserted records (ignoring date filter)")
             query = {
                 "inserted_to_sheet": {"$ne": True},
-                "platform": {"$ne": "reed"}
+                "platform": {"$ne": "reed"},
             }
         else:
             print(f"📅 Using command line specified target date: {target_date_str}")
             query = {
                 "inserted_to_sheet": {"$ne": True},
                 "detected_at": {"$regex": f"^{target_date_str}"},
-                "platform": {"$ne": "reed"}
+                "platform": {"$ne": "reed"},
             }
     else:
-        # Default: rolling window of the last LOOKBACK_DAYS days. Self-heals
-        # failed/missed runs (yesterday's leftovers get picked up today) without
-        # dragging in old orphans. detected_at is a "YYYY-MM-DD HH:MM:SS" string,
-        # so lexicographic $gte comparison works.
         cutoff = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
-        target_date_str = f"last {LOOKBACK_DAYS} days (since {cutoff})"
+        retry_cutoff = (
+            datetime.now() - timedelta(days=RETRY_PENDING_MAX_AGE_DAYS)
+        ).strftime("%Y-%m-%d")
+        target_date_str = (
+            f"last {LOOKBACK_DAYS} days (since {cutoff}) "
+            f"+ retry_pending (since {retry_cutoff})"
+        )
         print(f"📅 Processing uninserted records from the {target_date_str}")
         query = {
             "inserted_to_sheet": {"$ne": True},
-            "detected_at": {"$gte": cutoff},
-            "platform": {"$ne": "reed"}
+            "platform": {"$ne": "reed"},
+            "$or": [
+                {"detected_at": {"$gte": cutoff}},
+                {
+                    "ai_classification_status": "retry_pending",
+                    "detected_at": {"$gte": retry_cutoff},
+                },
+            ],
         }
-    
+
     records = list(collection.find(query))
+    stats["loaded"] = len(records)
     if not records:
         print(f"💡 No new uninserted records found for {target_date_str}.")
+        print("RUN_STATUS=success")
         return
 
     print(f"📦 Found {len(records)} new project(s) to process.")
-    
-    rows = []
-    inserted_ids = []
+
+    pending_rows = []
+    pending_success_ids = []
     skipped_ids = []
-    total_sent = 0
-    total_skipped = 0
+    retry_queue = []
+    remaining_unprocessed = []
+
+    # -------- First pass --------
     for i, rec in enumerate(records):
+        if runtime_limit_approaching(run_started_at):
+            print("⚠️ Runtime limit approaching. Stopping new AI calls.")
+            print("💾 Flushing all completed rows before shutdown.")
+            print("📌 Remaining records will stay uninserted for the next run.")
+            stats["runtime_guard"] = True
+            remaining_unprocessed.extend(records[i:])
+            run_status = "runtime_guard"
+            break
+
         title = rec.get("title", "Untitled")
         desc = rec.get("description", "")
-        
+
         if FILTER_ENGLISH_ONLY and not is_english(title, desc):
             print(f"  → [{i+1}/{len(records)}] 🚫 Skipping non-English job: {title[:40]}...")
             skipped_ids.append(rec["_id"])
-            total_skipped += 1
-        else:
-            print(f"  → [{i+1}/{len(records)}] Mapping & Classifying: {title[:40]}...")
-            row = map_record_to_row(rec)
-            print(f"    📋 Mapped: Platform Category='{row[2]}' | Category='{row[3]}' | Universal='{row[4]}' | Industry='{row[7]}' | Rate={row[9]}-{row[10]} | Duration={row[11]}-{row[12]} | Value={row[18]}-{row[19]}")
-            rows.append(row)
-            inserted_ids.append(rec["_id"])
-            # Pace API calls to stay within Groq rate limits
+            stats["skipped_non_english"] += 1
+            continue
+
+        print(f"  → [{i+1}/{len(records)}] Mapping & Classifying: {title[:40]}...")
+        try:
+            row = map_record_to_row(rec, prefer_fallback=False)
+            model_used = rec.get("_last_gemini_model") or GEMINI_PRIMARY_MODEL
+            if model_used == GEMINI_FALLBACK_MODEL:
+                stats["fallback_successes"] += 1
+            else:
+                stats["primary_successes"] += 1
+            pending_rows.append(row)
+            pending_success_ids.append(rec["_id"])
+            print(
+                f"    📋 Mapped: Platform Category='{row[2]}' | Category='{row[3]}' | "
+                f"Industry='{row[6]}' | Rate={row[8]}-{row[9]}"
+            )
+            if len(pending_rows) >= CHUNK_SIZE:
+                before = len(pending_success_ids)
+                if not flush_pending_successes(
+                    collection, pending_rows, pending_success_ids, skipped_ids
+                ):
+                    stats["webhook_failures"] += 1
+                    run_status = "webhook_failure"
+                    print("RUN_STATUS=webhook_failure")
+                    sys.exit(EXIT_WEBHOOK_FAILURE)
+                stats["inserted_first_pass"] += before
             if i < len(records) - 1:
-                time.sleep(1)
+                time.sleep(AI_REQUEST_DELAY_SECONDS)
+        except PermanentGeminiConfigError as error:
+            print(f"    ❌ Permanent Gemini configuration error: {error}")
+            if pending_rows or skipped_ids:
+                flush_pending_successes(
+                    collection, pending_rows, pending_success_ids, skipped_ids
+                )
+            remaining_unprocessed.extend(records[i:])
+            run_status = "permanent_config"
+            print("RUN_STATUS=permanent_config")
+            _print_summary(stats, len(retry_queue) + len(remaining_unprocessed))
+            sys.exit(EXIT_PERMANENT_CONFIG)
+        except AIClassificationError as error:
+            print(f"    ⚠️ AI classification failed: {error}")
+            if pending_rows:
+                before = len(pending_success_ids)
+                if not flush_pending_successes(
+                    collection, pending_rows, pending_success_ids, skipped_ids
+                ):
+                    stats["webhook_failures"] += 1
+                    run_status = "webhook_failure"
+                    print("RUN_STATUS=webhook_failure")
+                    sys.exit(EXIT_WEBHOOK_FAILURE)
+                stats["inserted_first_pass"] += before
+            save_retry_failure(collection, rec, error)
+            retry_queue.append(rec)
+            stats["deferred"] += 1
+            continue
 
-        # Persist progress every CHUNK_SIZE mapped rows
-        if len(rows) >= CHUNK_SIZE:
-            if not flush_chunk(collection, rows, inserted_ids, skipped_ids):
-                print("🛑 Stopping run after webhook failure; unsent records will be retried next run.")
-                return
-            total_sent += len(rows)
-            rows, inserted_ids, skipped_ids = [], [], []
+    # Flush remaining first-pass successes
+    if pending_rows or skipped_ids:
+        before = len(pending_success_ids)
+        if not flush_pending_successes(
+            collection, pending_rows, pending_success_ids, skipped_ids
+        ):
+            stats["webhook_failures"] += 1
+            run_status = "webhook_failure"
+            print("RUN_STATUS=webhook_failure")
+            sys.exit(EXIT_WEBHOOK_FAILURE)
+        stats["inserted_first_pass"] += before
 
-    # Flush whatever is left (also marks trailing non-English skips)
-    if rows or skipped_ids:
-        if not flush_chunk(collection, rows, inserted_ids, skipped_ids):
-            print("🛑 Final chunk failed; unsent records will be retried next run.")
-            return
-        total_sent += len(rows)
+    # -------- Deferred retry pass --------
+    if retry_queue and not stats["runtime_guard"] and run_status not in (
+        "permanent_config",
+        "webhook_failure",
+    ):
+        print(f"\n🔁 Starting deferred retry for {len(retry_queue)} record(s)...")
+        for retry_round in range(RECORD_RETRY_ROUNDS):
+            if not retry_queue:
+                break
+            if runtime_limit_approaching(run_started_at):
+                print("⚠️ Runtime limit approaching during deferred retry.")
+                stats["runtime_guard"] = True
+                run_status = "runtime_guard"
+                remaining_unprocessed.extend(retry_queue)
+                retry_queue = []
+                break
 
-    if total_sent == 0 and total_skipped > 0:
-        print(f"💡 No rows sent to spreadsheet (all {total_skipped} new records were filtered as non-English).")
-    else:
-        print(f"🎉 Finished processing. Sent {total_sent} row(s) to the sheet (skipped {total_skipped} non-English).")
+            current_queue = list(retry_queue)
+            retry_queue = []
+            print(f"  Retry round {retry_round + 1}/{RECORD_RETRY_ROUNDS}: {len(current_queue)} record(s)")
+
+            for qi, rec in enumerate(current_queue):
+                if runtime_limit_approaching(run_started_at):
+                    print("⚠️ Runtime limit approaching. Stopping new AI calls.")
+                    stats["runtime_guard"] = True
+                    run_status = "runtime_guard"
+                    remaining_unprocessed.extend(current_queue[qi:])
+                    current_queue = []
+                    break
+
+                title = rec.get("title", "Untitled")
+                print(f"  → Deferred retry: {title[:40]}...")
+                try:
+                    row = map_record_to_row(rec, prefer_fallback=True)
+                    model_used = rec.get("_last_gemini_model") or GEMINI_FALLBACK_MODEL
+                    print(f"    ✅ Deferred retry succeeded using {model_used}")
+                    pending_rows.append(row)
+                    pending_success_ids.append(rec["_id"])
+                    stats["deferred_retry_successes"] += 1
+                    if model_used == GEMINI_FALLBACK_MODEL:
+                        stats["fallback_successes"] += 1
+                    else:
+                        stats["primary_successes"] += 1
+                    mark_ai_retry_success(collection, rec)
+                    if len(pending_rows) >= CHUNK_SIZE:
+                        before = len(pending_success_ids)
+                        if not flush_pending_successes(
+                            collection, pending_rows, pending_success_ids, skipped_ids
+                        ):
+                            stats["webhook_failures"] += 1
+                            run_status = "webhook_failure"
+                            print("RUN_STATUS=webhook_failure")
+                            sys.exit(EXIT_WEBHOOK_FAILURE)
+                        stats["inserted_first_pass"] += before
+                    time.sleep(AI_REQUEST_DELAY_SECONDS)
+                except PermanentGeminiConfigError as error:
+                    print(f"    ❌ Permanent Gemini configuration error: {error}")
+                    if pending_rows or skipped_ids:
+                        flush_pending_successes(
+                            collection, pending_rows, pending_success_ids, skipped_ids
+                        )
+                    save_retry_failure(collection, rec, error)
+                    remaining_unprocessed.append(rec)
+                    remaining_unprocessed.extend(current_queue[qi + 1 :])
+                    run_status = "permanent_config"
+                    print("RUN_STATUS=permanent_config")
+                    _print_summary(stats, len(remaining_unprocessed))
+                    sys.exit(EXIT_PERMANENT_CONFIG)
+                except AIClassificationError as error:
+                    print(f"    ⚠️ Deferred retry still failing: {error}")
+                    save_retry_failure(collection, rec, error)
+                    retry_queue.append(rec)
+
+            if pending_rows or skipped_ids:
+                before = len(pending_success_ids)
+                if not flush_pending_successes(
+                    collection, pending_rows, pending_success_ids, skipped_ids
+                ):
+                    stats["webhook_failures"] += 1
+                    run_status = "webhook_failure"
+                    print("RUN_STATUS=webhook_failure")
+                    sys.exit(EXIT_WEBHOOK_FAILURE)
+                stats["inserted_first_pass"] += before
+
+    # Anything still in retry_queue after rounds remains pending
+    remaining_unprocessed.extend(retry_queue)
+    stats["still_pending"] = len(remaining_unprocessed)
+
+    if stats["runtime_guard"]:
+        run_status = "runtime_guard"
+    elif stats["still_pending"] > 0 and run_status == "success":
+        run_status = "partial_success"
+    elif stats["webhook_failures"]:
+        run_status = "webhook_failure"
+
+    _print_summary(stats, stats["still_pending"])
+    print(f"RUN_STATUS={run_status}")
+
+    if run_status == "success":
+        sys.exit(EXIT_SUCCESS)
+    if run_status == "partial_success":
+        sys.exit(EXIT_PARTIAL_SUCCESS)
+    if run_status == "runtime_guard":
+        sys.exit(EXIT_RUNTIME_GUARD)
+    if run_status == "permanent_config":
+        sys.exit(EXIT_PERMANENT_CONFIG)
+    if run_status == "webhook_failure":
+        sys.exit(EXIT_WEBHOOK_FAILURE)
+    sys.exit(EXIT_PARTIAL_SUCCESS)
+
+
+def _print_summary(stats, still_pending):
+    print("")
+    print("=" * 50)
+    print("Spreadsheet Insertion Summary")
+    print("=" * 50)
+    print(f"Records loaded: {stats.get('loaded', 0)}")
+    print(f"Inserted during first pass / flushes: {stats.get('inserted_first_pass', 0)}")
+    print(f"Primary-model successes: {stats.get('primary_successes', 0)}")
+    print(f"Fallback-model successes: {stats.get('fallback_successes', 0)}")
+    print(f"Deferred for retry: {stats.get('deferred', 0)}")
+    print(f"Deferred retry successes: {stats.get('deferred_retry_successes', 0)}")
+    print(f"Still pending for next run: {still_pending}")
+    print(f"Webhook failures: {stats.get('webhook_failures', 0)}")
+    print(f"Non-English skipped: {stats.get('skipped_non_english', 0)}")
+    print(f"Runtime guard activated: {'Yes' if stats.get('runtime_guard') else 'No'}")
+    print("=" * 50)
+
 
 if __name__ == "__main__":
     process_uninserted_records()

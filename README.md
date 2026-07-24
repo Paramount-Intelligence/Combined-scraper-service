@@ -27,9 +27,18 @@ Create a `.env` file at the root directory (based on the template below) or set 
 
 ```env
 MONGO_URI=your_mongodb_connection_uri
-GROQ_API_KEY=your_groq_api_key
-# Groq model for spreadsheet Category / field extraction (Railway Variables tab too)
-GROQ_CLASSIFICATION_MODEL=openai/gpt-oss-120b
+GEMINI_API_KEY=your_gemini_api_key
+GEMINI_PRIMARY_MODEL=gemini-3.5-flash-lite
+GEMINI_FALLBACK_MODEL=gemini-3.6-flash
+ENABLE_MODEL_FALLBACK=true
+CATEGORY_CONFIDENCE_THRESHOLD=0.70
+AI_ATTEMPTS_PER_MODEL=2
+AI_REQUEST_DELAY_SECONDS=2
+RECORD_RETRY_ROUNDS=2
+SPREADSHEET_CHUNK_SIZE=5
+MAX_RUN_SECONDS=3300
+SHUTDOWN_RESERVE_SECONDS=180
+GEMINI_TIMEOUT_MS=90000
 WEBHOOK_URL=your_google_sheets_webhook_url
 
 SMTP_SERVER=smtp.gmail.com
