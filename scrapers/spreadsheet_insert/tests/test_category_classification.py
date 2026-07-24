@@ -1,22 +1,28 @@
 """
-Tests for normalized Category classification (Groq policy + deterministic fallback).
-
-Fallback tests cover conservative rules used when Groq fails or returns an invalid category.
-Prompt tests ensure the business classification guide is embedded for Groq.
+Tests for normalized Category classification (Gemini policy + deterministic fallback)
+and Platform Category handling for the Gemini classification pipeline.
 """
 import os
 import sys
 import unittest
+from unittest.mock import MagicMock, patch
 
 _SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
+import insert_to_spreadsheet as ins  # noqa: E402
 from insert_to_spreadsheet import (  # noqa: E402
     CATEGORIES,
     CATEGORY_CLASSIFICATION_POLICY,
+    ProjectSemantics,
     deterministic_category_fallback,
+    extract_source_platform_category,
+    map_record_to_row,
+    query_gemini_semantics,
     resolve_normalized_category,
+    resolve_platform_category,
+    _is_transient_gemini_error,
 )
 
 
@@ -39,7 +45,7 @@ class TestAllowedCategories(unittest.TestCase):
 
 
 class TestResolveNormalizedCategory(unittest.TestCase):
-    def test_accepts_valid_groq_category(self):
+    def test_accepts_valid_gemini_category(self):
         cat, reason, conf, source = resolve_normalized_category(
             {
                 "category": "Information Technology",
@@ -50,11 +56,11 @@ class TestResolveNormalizedCategory(unittest.TestCase):
             description="Leads information security.",
         )
         self.assertEqual(cat, "Information Technology")
-        self.assertEqual(source, "groq")
+        self.assertEqual(source, "gemini")
         self.assertAlmostEqual(conf, 0.91)
         self.assertIn("Security", reason)
 
-    def test_invalid_groq_category_uses_fallback_not_sme(self):
+    def test_invalid_gemini_category_uses_fallback_not_sme(self):
         cat, reason, conf, source = resolve_normalized_category(
             {
                 "category": "Made Up Category",
@@ -85,7 +91,7 @@ class TestResolveNormalizedCategory(unittest.TestCase):
                 "category_reasoning": "Power BI developer.",
             }
         )
-        self.assertEqual(source, "groq")
+        self.assertEqual(source, "gemini")
         self.assertEqual(cat, "Data")
         self.assertEqual(conf, 1.0)
 
@@ -282,6 +288,206 @@ class TestCategoryPolicyInPrompt(unittest.TestCase):
 
     def test_policy_rejects_keyword_only_sme(self):
         self.assertIn("Those terms alone are insufficient", CATEGORY_CLASSIFICATION_POLICY)
+
+
+class TestPlatformCategoryRules(unittest.TestCase):
+    def test_catalant_keeps_source_platform_category(self):
+        project = {
+            "platform": "catalant",
+            "source_platform_category": "Technology Assessment",
+        }
+        semantics = {
+            "platform_category": "Information Technology",
+            "category": "Information Technology",
+        }
+        pc, src = resolve_platform_category(project, semantics)
+        self.assertEqual(pc, "Technology Assessment")
+        self.assertEqual(src, "catalant_source")
+        cat, _, _, cat_src = resolve_normalized_category(semantics, title="Tech Assessment")
+        self.assertEqual(cat, "Information Technology")
+        self.assertEqual(cat_src, "gemini")
+
+    def test_catalant_missing_source_is_unclassified(self):
+        pc, src = resolve_platform_category({"platform": "catalant"}, {"platform_category": "IT"})
+        self.assertEqual(pc, "Unclassified")
+        self.assertEqual(src, "missing_catalant_source")
+
+    def test_non_catalant_uses_gemini_platform_category(self):
+        project = {"platform": "btg", "title": "Information Security Leader"}
+        semantics = {
+            "platform_category": "Information Security",
+            "category": "Information Technology",
+        }
+        pc, src = resolve_platform_category(project, semantics)
+        self.assertEqual(pc, "Information Security")
+        self.assertEqual(src, "gemini")
+        cat, _, _, cat_src = resolve_normalized_category(semantics)
+        self.assertEqual(cat, "Information Technology")
+        self.assertEqual(cat_src, "gemini")
+
+    def test_extract_source_platform_category_priority(self):
+        self.assertEqual(
+            extract_source_platform_category(
+                {
+                    "source_platform_category": "Technology Assessment",
+                    "platform_category": "Other",
+                }
+            ),
+            "Technology Assessment",
+        )
+
+
+class TestGeminiProviderHelpers(unittest.TestCase):
+    def test_missing_key_does_not_crash_import(self):
+        # Module already imported; client may be None without key.
+        self.assertTrue(hasattr(ins, "gemini_client"))
+        self.assertTrue(hasattr(ins, "GEMINI_MODEL"))
+        self.assertEqual(ins.GEMINI_MODEL, os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"))
+
+    def test_query_returns_error_without_client(self):
+        with patch.object(ins, "gemini_client", None):
+            with self.assertRaises(ins.PermanentGeminiConfigError):
+                query_gemini_semantics("t", "d", {})
+
+    def test_transient_errors_detected(self):
+        self.assertTrue(_is_transient_gemini_error(RuntimeError("429 RESOURCE_EXHAUSTED")))
+        self.assertTrue(_is_transient_gemini_error(TimeoutError("deadline exceeded timeout")))
+        self.assertFalse(_is_transient_gemini_error(RuntimeError("401 invalid api key")))
+        self.assertFalse(_is_transient_gemini_error(RuntimeError("403 permission denied")))
+
+    def test_query_parses_structured_response(self):
+        payload = ProjectSemantics(
+            platform_category="Information Security",
+            category="Information Technology",
+            category_reasoning="Security leadership.",
+            category_confidence=0.9,
+            industry="Financial Services",
+            industry_secondary="Financial Services",
+            role_type="Consultant",
+            raw_rate_low=None,
+            raw_rate_high=None,
+            rate_currency=None,
+            rate_period=None,
+            duration_months_low=6,
+            duration_months_high=6,
+            utilization=1.0,
+            daily_rate_reasoning="No rate found.",
+        )
+        mock_response = MagicMock()
+        mock_response.text = payload.model_dump_json()
+        mock_response.usage_metadata = MagicMock(
+            prompt_token_count=10,
+            candidates_token_count=20,
+            total_token_count=30,
+        )
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = mock_response
+        with patch.object(ins, "gemini_client", mock_client):
+            result = query_gemini_semantics(
+                "Information Security Leader",
+                "Lead cyber security for a bank.",
+                {"platform": "btg"},
+            )
+        self.assertEqual(result["category"], "Information Technology")
+        self.assertEqual(result["platform_category"], "Information Security")
+        mock_client.models.generate_content.assert_called_once()
+        kwargs = mock_client.models.generate_content.call_args.kwargs
+        self.assertEqual(kwargs["model"], ins.GEMINI_MODEL)
+        self.assertNotIn("temperature", kwargs.get("config").model_dump(exclude_none=True))
+
+    def test_empty_response_retries_then_raises(self):
+        mock_response = MagicMock()
+        mock_response.text = ""
+        mock_response.usage_metadata = None
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = mock_response
+        with patch.object(ins, "gemini_client", mock_client):
+            with patch.object(ins, "time") as mock_time:
+                mock_time.sleep = MagicMock()
+                with self.assertRaises(ins.AIClassificationError):
+                    query_gemini_semantics("t", "d", {"platform": "btg"})
+        # primary attempts + fallback attempts
+        self.assertGreaterEqual(
+            mock_client.models.generate_content.call_count,
+            ins.AI_ATTEMPTS_PER_MODEL,
+        )
+
+    def test_permanent_error_not_retried(self):
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = RuntimeError("401 invalid api key")
+        with patch.object(ins, "gemini_client", mock_client):
+            with self.assertRaises(ins.PermanentGeminiConfigError):
+                query_gemini_semantics("t", "d", {})
+        self.assertEqual(mock_client.models.generate_content.call_count, 1)
+
+
+class TestSpreadsheetRowCompatibility(unittest.TestCase):
+    def test_row_shape_and_catalant_platform_category(self):
+        project = {
+            "platform": "catalant",
+            "source_platform_category": "Technology Assessment",
+            "title": "Tech Assessor",
+            "description": "Assess enterprise technology options.",
+            "detected_at": "2026-07-24 10:00:00",
+            "url": "https://example.com/job/1",
+            "remote_type": "Remote",
+            "location": "Remote",
+        }
+        semantics = {
+            "platform_category": "Information Technology",
+            "category": "Information Technology",
+            "category_reasoning": "Technology assessment work.",
+            "category_confidence": 0.88,
+            "industry": "Technology",
+            "industry_secondary": "Software and Services",
+            "role_type": "Consultant",
+            "raw_rate_low": None,
+            "raw_rate_high": None,
+            "rate_currency": None,
+            "rate_period": None,
+            "duration_months_low": 6,
+            "duration_months_high": 6,
+            "utilization": 1.0,
+            "daily_rate_reasoning": "No rate.",
+        }
+        with patch.object(ins, "query_gemini_semantics", return_value=semantics):
+            row = map_record_to_row(project)
+        self.assertEqual(len(row), 22)
+        self.assertEqual(row[2], "Technology Assessment")  # Platform Category
+        self.assertEqual(row[3], "Information Technology")  # Category
+        self.assertEqual(row[4], "Tech Assessor")
+        self.assertEqual(row[16], "Catalant")
+        self.assertEqual(row[19], "https://example.com/job/1")
+        self.assertEqual(row[21], "CATALANT")
+
+    def test_btg_platform_category_from_gemini(self):
+        project = {
+            "platform": "btg",
+            "title": "Information Security Leader",
+            "description": "Lead information security.",
+            "detected_at": "2026-07-24 10:00:00",
+            "url": "https://example.com/btg/1",
+            "remote_type": "Hybrid",
+        }
+        semantics = {
+            "platform_category": "Information Security",
+            "category": "Information Technology",
+            "category_reasoning": "Security leadership.",
+            "category_confidence": 0.9,
+            "industry": "Financial Services",
+            "industry_secondary": "Financial Services",
+            "role_type": "Consultant",
+            "duration_months_low": 3,
+            "duration_months_high": 6,
+            "utilization": 1.0,
+            "daily_rate_reasoning": "No rate.",
+        }
+        with patch.object(ins, "query_gemini_semantics", return_value=semantics):
+            row = map_record_to_row(project)
+        self.assertEqual(row[2], "Information Security")
+        self.assertEqual(row[3], "Information Technology")
+        self.assertEqual(row[16], "BTG")
+        self.assertEqual(len(row), 22)
 
 
 if __name__ == "__main__":
