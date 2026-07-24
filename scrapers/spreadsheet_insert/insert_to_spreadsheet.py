@@ -40,8 +40,30 @@ MAX_RUN_SECONDS = int(os.getenv("MAX_RUN_SECONDS", "3300"))
 SHUTDOWN_RESERVE_SECONDS = int(os.getenv("SHUTDOWN_RESERVE_SECONDS", "180"))
 GEMINI_TIMEOUT_MS = int(os.getenv("GEMINI_TIMEOUT_MS", "90000"))
 RETRY_PENDING_MAX_AGE_DAYS = int(os.getenv("RETRY_PENDING_MAX_AGE_DAYS", "30"))
+# Fallback only when source JD/website and Gemini have no usable duration.
+FALLBACK_DURATION_MONTHS = 12.0
 # Repository-owned retries only (SDK auto-retries minimized via attempts=1)
 CHUNK_SIZE = SPREADSHEET_CHUNK_SIZE
+
+DURATION_SOURCE_FIELDS = [
+    "duration",
+    "project_duration",
+    "project_length",
+    "engagement_duration",
+    "duration_text",
+    "contract_duration",
+    "estimated_duration",
+]
+INVALID_DURATION_VALUES = {
+    "",
+    "none",
+    "null",
+    "nan",
+    "n/a",
+    "tbd",
+    "-",
+    "not specified",
+}
 
 # Initialize Gemini client.
 # Retry ownership: this module performs explicit per-model attempts (AI_ATTEMPTS_PER_MODEL).
@@ -506,8 +528,207 @@ def extract_source_platform_category(project: dict) -> str:
     return ""
 
 
+def safe_float(value):
+    """Parse a float; return None when missing or invalid."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _looks_like_experience_not_duration(text: str) -> bool:
+    """Reject experience / seniority / education text that must not become engagement duration."""
+    t = str(text or "").lower().strip()
+    if not t:
+        return True
+    if re.search(
+        r"\b(experience|experienced|seniority|years?\s+of\s+experience|"
+        r"yrs?\s+of\s+experience|working\s+with)\b",
+        t,
+    ):
+        return True
+    if re.search(r"\b(mid|junior|senior)\s+level\b", t):
+        return True
+    if re.search(
+        r"\b(education|degree|bachelor|master|phd|deadline|due date|closes on|founded)\b",
+        t,
+    ):
+        return True
+    # "5+ years" alone is almost always experience, not engagement length
+    if re.search(r"\b\d+\s*\+\s*years?\b", t):
+        if not re.search(r"\b(month|week|day|contract|engagement|duration)\b", t):
+            return True
+    return False
+
+
+def _normalize_duration_unit(unit: str) -> str:
+    u = (unit or "").lower().rstrip("s")
+    if u.startswith("week"):
+        return "week"
+    if u.startswith("year"):
+        return "year"
+    if u.startswith("day"):
+        return "day"
+    return "month"
+
+
+def _duration_pair_to_months(low: float, high: float, unit: str):
+    kind = _normalize_duration_unit(unit)
+    if low > high:
+        low, high = high, low
+    if kind == "week":
+        return (low / 4.0, high / 4.0)
+    if kind == "year":
+        return (low * 12.0, high * 12.0)
+    if kind == "day":
+        return (low / 20.0, high / 20.0)
+    return (low, high)
+
+
+def parse_duration_to_months(duration_value: str):
+    """
+    Parse an explicit engagement-duration string into (low, high) months.
+    Returns None when the text is missing, unparseable, or experience-like.
+    """
+    if duration_value is None:
+        return None
+    text = str(duration_value).strip()
+    if not text or text.lower() in INVALID_DURATION_VALUES:
+        return None
+    if _looks_like_experience_not_duration(text):
+        return None
+
+    normalized = (
+        text.replace("–", "-")
+        .replace("—", "-")
+        .replace("−", "-")
+    )
+    normalized = re.sub(r"\s+", " ", normalized)
+
+    # Between 4 and 6 months
+    m = re.search(
+        r"(?i)\bbetween\s+(\d+(?:\.\d+)?)\s+and\s+(\d+(?:\.\d+)?)\s*"
+        r"(months?|weeks?|years?|days?)\b",
+        normalized,
+    )
+    if m:
+        return _duration_pair_to_months(
+            float(m.group(1)), float(m.group(2)), m.group(3)
+        )
+
+    # 3-5 months / 3 to 5 months / 6-12 weeks
+    m = re.search(
+        r"(?i)(\d+(?:\.\d+)?)\s*(?:-|to)\s*(\d+(?:\.\d+)?)\s*"
+        r"(months?|weeks?|years?|days?)\b",
+        normalized,
+    )
+    if m:
+        return _duration_pair_to_months(
+            float(m.group(1)), float(m.group(2)), m.group(3)
+        )
+
+    # 6 Months / 12-month contract / Duration: 9 months
+    m = re.search(
+        r"(?i)(?:(?:duration|engagement(?:\s+length)?|contract(?:\s+length)?|"
+        r"project(?:\s+length)?)\s*[:\-]?\s*)?"
+        r"(\d+(?:\.\d+)?)\s*-?\s*(months?|weeks?|years?|days?)\b",
+        normalized,
+    )
+    if m:
+        val = float(m.group(1))
+        return _duration_pair_to_months(val, val, m.group(2))
+
+    return None
+
+
+def _extract_labeled_duration_from_text(text: str) -> str:
+    """Find an explicit Duration:/Engagement length: style value in free text."""
+    if not text:
+        return ""
+    patterns = [
+        r"(?i)\b(?:duration|engagement\s+length|contract\s+length|project\s+length|"
+        r"engagement\s+duration|estimated\s+duration)\s*[:\-]\s*([^\n.;|]{1,80})",
+        r"(?i)\b(?:duration|engagement)\s+of\s+"
+        r"(\d+(?:\.\d+)?\s*(?:(?:-|to)\s*\d+(?:\.\d+)?)?\s*"
+        r"(?:months?|weeks?|years?|days?))",
+    ]
+    for pat in patterns:
+        match = re.search(pat, text)
+        if not match:
+            continue
+        candidate = match.group(1).strip()
+        if parse_duration_to_months(candidate):
+            return candidate
+    return ""
+
+
+def extract_source_duration(project: dict) -> str:
+    """
+    Return the first valid duration explicitly captured from the
+    source platform or structured project metadata.
+    """
+    project = project or {}
+    for field in DURATION_SOURCE_FIELDS:
+        value = project.get(field)
+        if value is None:
+            continue
+        normalized = str(value).strip()
+        if not normalized or normalized.lower() in INVALID_DURATION_VALUES:
+            continue
+        if parse_duration_to_months(normalized):
+            return normalized
+
+    for text_field in ("description", "summary", "title"):
+        labeled = _extract_labeled_duration_from_text(
+            str(project.get(text_field) or "")
+        )
+        if labeled:
+            return labeled
+    return ""
+
+
+def resolve_duration_months(project: dict, semantics: dict):
+    """
+    Authoritative duration resolution.
+    Priority: structured source → labeled text → Gemini → default.
+    """
+    source_duration_text = extract_source_duration(project)
+    parsed_source = parse_duration_to_months(source_duration_text)
+    if parsed_source:
+        dur_low, dur_high = parsed_source
+        print(
+            f"    ⏱️ Duration source [source]: raw={source_duration_text!r} "
+            f"→ {dur_low}-{dur_high} months"
+        )
+        return dur_low, dur_high, "source", source_duration_text
+
+    dur_low = safe_float(semantics.get("duration_months_low"))
+    dur_high = safe_float(semantics.get("duration_months_high"))
+    if dur_low is not None:
+        if dur_high is None:
+            dur_high = dur_low
+        print(
+            f"    ⏱️ Duration source [gemini]: {dur_low}-{dur_high} months"
+        )
+        return float(dur_low), float(dur_high), "gemini", source_duration_text
+
+    print(
+        f"    ⚠️ No explicit duration found in source/JD. "
+        f"Using fallback: {FALLBACK_DURATION_MONTHS:g} months"
+    )
+    return (
+        FALLBACK_DURATION_MONTHS,
+        FALLBACK_DURATION_MONTHS,
+        "default",
+        source_duration_text,
+    )
+
+
 def build_curated_record_dump(extra: dict) -> dict:
     """Compact metadata payload for Gemini — excludes empty values and full Mongo docs."""
+    source_duration = extract_source_duration(extra)
     raw = {
         "platform": extra.get("platform"),
         "source_platform_category": extract_source_platform_category(extra),
@@ -522,6 +743,7 @@ def build_curated_record_dump(extra: dict) -> dict:
         "location_pref": extra.get("location_pref"),
         "project_length": extra.get("project_length"),
         "duration": extra.get("duration"),
+        "exact_source_duration": source_duration or None,
         "rate": extra.get("rate"),
         "salary": extra.get("salary"),
         "budget": extra.get("budget"),
@@ -861,7 +1083,13 @@ Extract the raw numerical rate information exactly as stated in the fields or de
 - Sanity check (max daily rate $2500 USD): after converting to daily USD (hourly×8, monthly÷20, annually÷260; GBP×1.27, EUR×1.08), each daily rate must be ≤ 2500. If your extracted numbers would imply a daily USD rate above 2500, you almost certainly dropped a decimal or misread the amount — re-read the source and correct it. Typical consulting/freelance daily rates are roughly 200–2500 USD.
 
 ### duration_months_low / duration_months_high
-Extract contract length in months. If a range is specified (e.g. 3-6 months), set low to 3 and high to 6. If only one value is specified, use it for both low and high, never make up numbers from yourself. Default: 6.
+Extract contract / engagement length in months.
+For duration extraction, the explicit structured source-platform duration is authoritative.
+Copy and convert that duration exactly.
+Do not infer duration from experience requirements, seniority, deadlines, start dates, or unrelated numbers.
+If a range is specified (e.g. 3-6 months), set low to 3 and high to 6.
+If only one value is specified, use it for both low and high.
+Never invent numbers. If no duration is stated in the source platform fields or JD, use 12 for both low and high.
 
 ### utilization
 Full-time (≥8 hrs/day or 5 days/week) → 1.0
@@ -879,11 +1107,13 @@ Explain where the raw values were found (e.g. "Found salary: '£45,000 per annum
     record_dump = build_curated_record_dump(extra)
     source_platform = str(extra.get("platform") or "").strip()
     source_pc = extract_source_platform_category(extra)
+    source_duration = extract_source_duration(extra)
     user_content = (
         f"Title: {title}\n"
         f"Description: {description}\n"
         f"Source platform: {source_platform}\n"
         f"Exact source Platform Category: {source_pc}\n"
+        f"Exact Source Duration: {source_duration or 'Not provided'}\n"
         f"Source category breadcrumb: {extra.get('category_path') or extra.get('breadcrumb') or ''}\n"
         f"Relevant employment / location / duration / rate metadata:\n"
         f"{json.dumps(record_dump, default=str, indent=2)}"
@@ -1286,18 +1516,13 @@ def map_record_to_row(project: dict, prefer_fallback: bool = False) -> list:
         except Exception as e:
             pass
 
-    try:
-        dur_low = float(semantics.get("duration_months_low") or 6)
-    except:
-        dur_low = 6.0
-    try:
-        dur_high = float(semantics.get("duration_months_high") or 6)
-    except:
-        dur_high = 6.0
+    dur_low, dur_high, duration_source, _raw_source_duration = resolve_duration_months(
+        project, semantics
+    )
 
     try:
         utilization_val = float(semantics.get("utilization") or 1.0)
-    except:
+    except Exception:
         utilization_val = 1.0
 
     # 3. Post-LLM Python potential value calculation
@@ -1309,11 +1534,24 @@ def map_record_to_row(project: dict, prefer_fallback: bool = False) -> list:
     # Format values back for spreadsheet columns
     rate_low_str = f"${int(rate_low):,}"
     rate_high_str = f"${int(rate_high):,}"
-    duration_low_str = str(dur_low)
-    duration_high_str = str(dur_high)
+
+    def _fmt_duration(val: float) -> str:
+        return str(int(val)) if float(val).is_integer() else str(val)
+
+    duration_low_str = _fmt_duration(dur_low)
+    duration_high_str = _fmt_duration(dur_high)
     utilization_str = str(utilization_val)
     value_low_str = f"${int(pot_val_low):,}"
     value_high_str = f"${int(pot_val_high):,}"
+    # Stash for clearer mapped-row logging (not part of spreadsheet schema)
+    project["_duration_source"] = duration_source
+    project["_mapped_rate_low"] = rate_low_str
+    project["_mapped_rate_high"] = rate_high_str
+    project["_mapped_duration_low"] = duration_low_str
+    project["_mapped_duration_high"] = duration_high_str
+    project["_mapped_utilization"] = utilization_str
+    project["_mapped_value_low"] = value_low_str
+    project["_mapped_value_high"] = value_high_str
 
     # Source & Flat Platform mapping
     db_platform = project.get("platform", "fintalent")
@@ -1583,9 +1821,18 @@ def process_uninserted_records():
                 stats["primary_successes"] += 1
             pending_rows.append(row)
             pending_success_ids.append(rec["_id"])
+            rate_low = row[8]
+            rate_high = row[9]
+            duration_low = row[10]
+            duration_high = row[11]
+            utilization = row[12]
+            value_low = row[17]
+            value_high = row[18]
             print(
                 f"    📋 Mapped: Platform Category='{row[2]}' | Category='{row[3]}' | "
-                f"Industry='{row[6]}' | Rate={row[8]}-{row[9]}"
+                f"Industry='{row[6]}' | Rate={rate_low}-{rate_high} | "
+                f"Duration={duration_low}-{duration_high} | Utilization={utilization} | "
+                f"Value={value_low}-{value_high}"
             )
             if len(pending_rows) >= CHUNK_SIZE:
                 before = len(pending_success_ids)

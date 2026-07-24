@@ -524,8 +524,27 @@ def extract_project_data(card):
                         budget = t
 
                 # Duration: time-unit words (guard: "X ago" already handled above)
+                # Do not treat experience/seniority strings as engagement duration.
                 elif not duration and len(t) < 60:
-                    if any(w in t.lower() for w in ("week", "month", "year", "day")) and "ago" not in t.lower():
+                    t_low = t.lower()
+                    looks_like_experience = (
+                        "experience" in t_low
+                        or "mid level" in t_low
+                        or "senior level" in t_low
+                        or "junior level" in t_low
+                        or bool(re.search(
+                            r"\b\d+\s*\+?\s*[-–to]+\s*\d+\s*\+?\s*years?\b",
+                            t_low,
+                        ))
+                    )
+                    has_duration_unit = any(
+                        w in t_low for w in ("week", "month", "year", "day")
+                    )
+                    if (
+                        has_duration_unit
+                        and "ago" not in t_low
+                        and not looks_like_experience
+                    ):
                         duration = t
 
                 # Location: place/timezone keywords
