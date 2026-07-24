@@ -5,6 +5,12 @@ import json
 import os
 import re
 import hashlib
+import platform
+import shutil
+import subprocess
+import tempfile
+import traceback
+from pathlib import Path
 from pymongo import MongoClient, UpdateOne
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
@@ -13,7 +19,11 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import (
+    TimeoutException,
+    NoSuchElementException,
+    WebDriverException,
+)
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.keys import Keys
 from dotenv import load_dotenv
@@ -25,13 +35,60 @@ if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', line_buffering=True)
 
 # Load .env: local scraper dir first, then repo root
-_script_dir = os.path.dirname(os.path.abspath(__file__))
-_root_dir = os.path.abspath(os.path.join(_script_dir, "..", ".."))
+SCRIPT_DIR = Path(__file__).resolve().parent
+LOCAL_PROFILE_DIR = SCRIPT_DIR / ".chrome_profile"
+_script_dir = str(SCRIPT_DIR)
+_root_dir = str(SCRIPT_DIR.parent.parent)
 if os.path.exists(os.path.join(_script_dir, ".env")):
     load_dotenv(dotenv_path=os.path.join(_script_dir, ".env"))
 load_dotenv(dotenv_path=os.path.join(_root_dir, ".env"))
 
 PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time (UTC+5)
+
+# ============================
+# ENVIRONMENT / BROWSER CONFIG
+# ============================
+RAILWAY_ENV_VARS = (
+    "RAILWAY_ENVIRONMENT",
+    "RAILWAY_PROJECT_ID",
+    "RAILWAY_SERVICE_ID",
+    "RAILWAY_DEPLOYMENT_ID",
+)
+
+
+def detect_is_railway(environ=None) -> bool:
+    env = environ if environ is not None else os.environ
+    return any(env.get(name) for name in RAILWAY_ENV_VARS)
+
+
+def resolve_expert360_headless(is_railway: bool, environ=None) -> bool:
+    """Railway always headless; local defaults to visible Chrome."""
+    if is_railway:
+        return True
+    env = environ if environ is not None else os.environ
+    return env.get("EXPERT360_HEADLESS", "false").lower() == "true"
+
+
+def resolve_use_persistent_profile(is_railway: bool, environ=None) -> bool:
+    """Persistent profile is local-only; Railway always uses a unique temp profile."""
+    if is_railway:
+        return False
+    env = environ if environ is not None else os.environ
+    return env.get("EXPERT360_USE_PERSISTENT_PROFILE", "true").lower() == "true"
+
+
+IS_RAILWAY = detect_is_railway()
+print(f"Railway environment detected: {IS_RAILWAY}")
+
+EXPERT360_HEADLESS = resolve_expert360_headless(IS_RAILWAY)
+USE_PERSISTENT_PROFILE = resolve_use_persistent_profile(IS_RAILWAY)
+
+MAX_BROWSER_START_ATTEMPTS = int(
+    os.getenv("EXPERT360_BROWSER_START_ATTEMPTS", "2")
+)
+# Optional virtual display — off by default; prefer --headless=new.
+EXPERT360_USE_XVFB = os.getenv("EXPERT360_USE_XVFB", "false").lower() == "true"
+
 
 # ============================
 # CONFIGURATION
@@ -59,13 +116,8 @@ class Config:
         e.strip() for e in os.getenv("RECIPIENT_EMAILS", "").split(",") if e.strip()
     ]
 
-    # Expert360 bot challenges block standard headless Chrome; default headed unless overridden
-    _e360_hl = os.getenv("EXPERT360_HEADLESS")
-    if _e360_hl is None:
-        HEADLESS = False
-    else:
-        HEADLESS = _e360_hl.lower() == "true"
-    COOKIES_FILE = os.path.join(_script_dir, "expert360_cookies.json")
+    HEADLESS = EXPERT360_HEADLESS
+    COOKIES_FILE = str(SCRIPT_DIR / "expert360_cookies.json")
     MONGO_URI    = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 
     BASE_URL    = "https://app.expert360.com"
@@ -841,111 +893,231 @@ def send_notification(project):
 # ============================
 # DRIVER SETUP
 # ============================
-def _detect_chrome_major():
-    """Best-effort installed Chrome major version (Windows registry / binary path)."""
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome\BLBeacon")
-        ver, _ = winreg.QueryValueEx(key, "version")
-        return int(str(ver).split(".")[0])
-    except Exception:
-        pass
-    for path in (
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+def _find_browser_binary():
+    """Locate Chrome/Chromium without hard-coded Windows paths."""
+    env_bin = (os.getenv("CHROME_BIN") or "").strip()
+    if env_bin and os.path.exists(env_bin):
+        return env_bin
+    for name in (
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
     ):
-        try:
-            if os.path.exists(path):
-                # Parent dirs are version folders sometimes; FileVersion via powershell is heavier —
-                # read adjacent version folder name.
-                parent = os.path.dirname(path)
-                for name in os.listdir(parent):
-                    if name[0].isdigit() and "." in name:
-                        return int(name.split(".")[0])
-        except Exception:
-            continue
+        found = shutil.which(name)
+        if found:
+            return found
+    for path in (
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+    ):
+        if os.path.exists(path):
+            return path
     return None
 
 
-def _clear_profile_locks(profile_dir):
-    if not profile_dir or not os.path.isdir(profile_dir):
+def _detect_chrome_major():
+    """Best-effort installed Chrome/Chromium major version (cross-platform)."""
+    browser = _find_browser_binary()
+    if not browser:
+        return None
+    try:
+        result = subprocess.run(
+            [browser, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        output = (result.stdout or result.stderr or "").strip()
+        match = re.search(r"(\d+)\.", output)
+        if match:
+            return int(match.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def log_browser_environment():
+    print(f"OS: {platform.platform()}")
+    print(f"Python: {platform.python_version()}")
+    print(f"Railway: {IS_RAILWAY}")
+    print(f"Headless: {EXPERT360_HEADLESS}")
+    print(f"Persistent profile: {USE_PERSISTENT_PROFILE}")
+    print(f"DISPLAY: {os.getenv('DISPLAY')}")
+    print(f"CHROME_BIN env: {os.getenv('CHROME_BIN')}")
+    print(f"Chrome path: {shutil.which('google-chrome')}")
+    print(f"Chromium path: {shutil.which('chromium') or shutil.which('chromium-browser')}")
+    print(f"ChromeDriver path: {shutil.which('chromedriver')}")
+    print(f"Resolved browser: {_find_browser_binary()}")
+
+    commands = [
+        ["google-chrome", "--version"],
+        ["google-chrome-stable", "--version"],
+        ["chromium", "--version"],
+        ["chromium-browser", "--version"],
+        ["chromedriver", "--version"],
+    ]
+    for command in commands:
+        if shutil.which(command[0]):
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                output = (result.stdout.strip() or result.stderr.strip())
+                print(f"{command[0]} version: {output}")
+            except Exception as error:
+                print(f"Could not read {command[0]} version: {error}")
+
+
+def assert_browser_available():
+    if not any([
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        _find_browser_binary(),
+    ]):
+        raise RuntimeError(
+            "No Chrome or Chromium executable was found "
+            "in the production container."
+        )
+
+
+def create_runtime_profile():
+    """
+    Local: optional persistent profile under scrapers/expert360/.chrome_profile
+    Railway: unique temporary profile under /tmp (or system temp).
+    """
+    if USE_PERSISTENT_PROFILE:
+        LOCAL_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        _clear_stale_profile_locks(str(LOCAL_PROFILE_DIR))
+        return str(LOCAL_PROFILE_DIR)
+
+    tmp_root = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
+    profile_dir = tempfile.mkdtemp(prefix="expert360-profile-", dir=tmp_root)
+    print(f"  Created temporary Chrome profile: {profile_dir}")
+    return profile_dir
+
+
+def _clear_stale_profile_locks(profile_dir):
+    """
+    Remove stale Chrome lock files from a local persistent profile.
+    Skipped on Railway (unique temp profiles). Does not attempt process
+    ownership checks beyond ignoring missing/busy files.
+    """
+    if IS_RAILWAY or not profile_dir or not os.path.isdir(profile_dir):
         return
-    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"):
+    for name in (
+        "SingletonLock",
+        "SingletonCookie",
+        "SingletonSocket",
+        "DevToolsActivePort",
+        "lockfile",
+    ):
         path = os.path.join(profile_dir, name)
         try:
             if os.path.exists(path):
                 os.remove(path)
-        except Exception:
-            pass
+                print(f"  Cleared stale profile lock: {name}")
+        except Exception as error:
+            print(f"  ⚠️ Could not clear {name}: {error}")
 
 
-def initialize_driver():
+def build_expert360_chrome_options(headless: bool, user_data_dir: str):
     """
-    Launch Chrome with anti-bot hardening.
-    Prefers undetected-chromedriver for Expert360's security interstitial;
-    falls back to shared chrome_helper if UC is unavailable.
+    Build container-safe Chrome options.
+    Headless is applied only via --headless=new here (not also via UC ctor).
+    """
+    try:
+        import undetected_chromedriver as uc
+        options = uc.ChromeOptions()
+    except Exception:
+        options = Options()
+
+    if headless:
+        options.add_argument("--headless=new")
+
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-features=Translate,BackForwardCache")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--lang=en-US")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--remote-debugging-port=0")
+    options.add_argument(f"--user-data-dir={user_data_dir}")
+
+    browser_bin = _find_browser_binary()
+    if browser_bin:
+        options.binary_location = browser_bin
+
+    return options
+
+
+def create_expert360_driver(user_data_dir: str):
+    """
+    Create one Chrome/UC driver for the given profile directory.
+    Does not retry; caller owns startup retries.
     """
     import sys as _sys
-    _sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    _sys.path.insert(0, str(SCRIPT_DIR.parent))
 
-    profile_dir = os.path.join(_script_dir, ".chrome_profile")
-    os.makedirs(profile_dir, exist_ok=True)
-    _clear_profile_locks(profile_dir)
+    log_browser_environment()
+    if IS_RAILWAY:
+        assert_browser_available()
+
+    headless = bool(Config.HEADLESS)
+    options = build_expert360_chrome_options(headless=headless, user_data_dir=user_data_dir)
+    browser_bin = _find_browser_binary()
     chrome_major = _detect_chrome_major()
     print(
-        f"  Starting Chrome (HEADLESS={Config.HEADLESS}, "
-        f"chrome_major={chrome_major}, profile={profile_dir})"
+        f"  Starting Chrome (HEADLESS={headless}, "
+        f"chrome_major={chrome_major}, profile={user_data_dir}, "
+        f"binary={browser_bin})"
     )
 
-    # 1) Prefer undetected-chromedriver (bypasses Expert360 security verification)
+    # Prefer undetected-chromedriver (Expert360 security interstitial).
+    # Headless is configured only via options to avoid duplicate flags.
     try:
         import undetected_chromedriver as uc
 
-        last_err = None
-        for attempt, use_profile in enumerate((True, False), start=1):
-            try:
-                options = uc.ChromeOptions()
-                options.add_argument("--lang=en-US,en")
-                options.add_argument("--window-size=1920,1080")
-                options.add_argument("--no-first-run")
-                options.add_argument("--no-default-browser-check")
-                options.add_argument("--disable-popup-blocking")
-                if use_profile:
-                    _clear_profile_locks(profile_dir)
-                    options.add_argument(f"--user-data-dir={profile_dir}")
-                if Config.HEADLESS:
-                    options.add_argument("--headless=new")
-                    options.add_argument("--disable-gpu")
+        kwargs = {
+            "options": options,
+            "use_subprocess": True,
+        }
+        if browser_bin:
+            kwargs["browser_executable_path"] = browser_bin
+        # Dynamically detected major only — never hard-code a local Windows version.
+        if chrome_major:
+            kwargs["version_main"] = chrome_major
 
-                kwargs = {
-                    "options": options,
-                    "headless": Config.HEADLESS,
-                    "use_subprocess": True,
-                }
-                if chrome_major:
-                    kwargs["version_main"] = chrome_major
-
-                print(f"  UC attempt {attempt} (persistent_profile={use_profile})...")
-                driver = uc.Chrome(**kwargs)
-                print("  ✅ Using undetected-chromedriver")
-                return driver
-            except Exception as e:
-                last_err = e
-                print(f"  ⚠️ UC attempt {attempt} failed: {e}")
-        raise last_err
+        driver = uc.Chrome(**kwargs)
+        print("  ✅ Using undetected-chromedriver")
+        return driver
     except Exception as e:
-        print(f"  ⚠️ undetected-chromedriver unavailable ({e}); falling back to chrome_helper")
+        print(f"  ⚠️ undetected-chromedriver failed ({type(e).__name__}: {e})")
+        print("  Falling back to chrome_helper...")
 
-    # 2) Fallback: shared helper + CDP stealth (no locked custom profile)
     prev_headless = os.environ.get("HEADLESS")
-    os.environ["HEADLESS"] = "True" if Config.HEADLESS else "False"
+    os.environ["HEADLESS"] = "True" if headless else "False"
     try:
         from chrome_helper import build_driver
         extra = [
-            "--lang=en-US,en",
-            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            f"--user-data-dir={user_data_dir}",
+            "--lang=en-US",
+            "--remote-debugging-port=0",
         ]
         driver = build_driver(extra_options=extra)
         try:
@@ -957,20 +1129,77 @@ def initialize_driver():
                     Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
                 """
             })
-            driver.execute_cdp_cmd("Network.setUserAgentOverride", {
-                "userAgent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                )
-            })
-        except Exception as e:
-            print(f"  ⚠️ Stealth CDP hooks failed (continuing): {e}")
+        except Exception as stealth_err:
+            print(f"  ⚠️ Stealth CDP hooks failed (continuing): {stealth_err}")
         return driver
     finally:
         if prev_headless is None:
             os.environ.pop("HEADLESS", None)
         else:
             os.environ["HEADLESS"] = prev_headless
+
+
+def _quit_driver_quietly(driver):
+    if driver is None:
+        return
+    try:
+        driver.quit()
+    except Exception as quit_error:
+        print(f"⚠️ Expert360 driver cleanup failed: {quit_error}")
+
+
+def _cleanup_temp_profile(profile_dir):
+    if not profile_dir:
+        return
+    if USE_PERSISTENT_PROFILE:
+        return
+    try:
+        if os.path.isdir(profile_dir):
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            print(f"  🧹 Removed temporary profile: {profile_dir}")
+    except Exception as cleanup_error:
+        print(f"⚠️ Profile cleanup failed: {cleanup_error}")
+
+
+def initialize_driver_with_retry():
+    """
+    Start Chrome with at most MAX_BROWSER_START_ATTEMPTS attempts.
+    Each failed attempt quits any partial driver and replaces temp profiles.
+    Returns (driver, profile_dir).
+    """
+    last_error = None
+    for attempt in range(1, MAX_BROWSER_START_ATTEMPTS + 1):
+        driver = None
+        profile_dir = None
+        try:
+            profile_dir = create_runtime_profile()
+            print(
+                f"  Browser start attempt {attempt}/{MAX_BROWSER_START_ATTEMPTS} "
+                f"(profile={profile_dir})"
+            )
+            driver = create_expert360_driver(profile_dir)
+            return driver, profile_dir
+        except Exception as error:
+            last_error = error
+            print(
+                f"❌ Expert360 browser start failed "
+                f"(attempt {attempt}/{MAX_BROWSER_START_ATTEMPTS}): "
+                f"{type(error).__name__}: {getattr(error, 'msg', None) or error}"
+            )
+            traceback.print_exc()
+            _quit_driver_quietly(driver)
+            _cleanup_temp_profile(profile_dir)
+            if attempt < MAX_BROWSER_START_ATTEMPTS:
+                print("  Waiting 5s before browser start retry...")
+                time.sleep(5)
+
+    raise last_error
+
+
+# Backwards-compatible alias used by older call sites/tests
+def initialize_driver():
+    driver, _profile = initialize_driver_with_retry()
+    return driver
 
 
 def ensure_authenticated(driver):
@@ -1012,21 +1241,27 @@ def main():
     print(f"  Target    : {Config.TARGET_URL}")
     print(f"  Email set : {bool(Config.EXPRESS_EMAIL)}")
     print(f"  Headless  : {Config.HEADLESS}")
+    print(f"  Railway   : {IS_RAILWAY}")
+    print(f"  Persistent profile: {USE_PERSISTENT_PROFILE}")
     print(f"  Recipients: {', '.join(Config.RECIPIENT_EMAILS)}")
     print()
 
-    driver = initialize_driver()
+    driver = None
+    runtime_profile_dir = None
     try:
+        driver, runtime_profile_dir = initialize_driver_with_retry()
+
         if not ensure_authenticated(driver):
-            # Headless challenges often never clear — one retry with headed Chrome
-            if Config.HEADLESS:
+            # Local-only: headless challenges may never clear — one headed retry.
+            # Never flip to headed Chrome on Railway (no display).
+            if Config.HEADLESS and not IS_RAILWAY:
                 print("⚠️ Auth failed under headless. Retrying with headed Chrome...")
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+                _quit_driver_quietly(driver)
+                driver = None
+                _cleanup_temp_profile(runtime_profile_dir)
+                runtime_profile_dir = None
                 Config.HEADLESS = False
-                driver = initialize_driver()
+                driver, runtime_profile_dir = initialize_driver_with_retry()
                 if not ensure_authenticated(driver):
                     print("❌ Authentication / security challenge failed. Exiting.")
                     dump_page_structure(driver)
@@ -1077,15 +1312,29 @@ def main():
             print("⏳ No new projects detected.")
 
     except Exception as e:
-        print(f"💥 Critical Failure during monitor run: {e}")
+        print(f"💥 Critical Failure during monitor run: {type(e).__name__}: {e}")
+        traceback.print_exc()
         raise
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        _quit_driver_quietly(driver)
+        _cleanup_temp_profile(runtime_profile_dir)
         print("🏁 Expert360 Monitor run complete.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except WebDriverException as error:
+        print(
+            "❌ Expert360 WebDriver failure: "
+            f"{getattr(error, 'msg', None) or error}"
+        )
+        traceback.print_exc()
+        sys.exit(1)
+    except Exception as error:
+        print(
+            "❌ Expert360 fatal error: "
+            f"{type(error).__name__}: {error}"
+        )
+        traceback.print_exc()
+        sys.exit(1)

@@ -6,7 +6,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     CHROME_BIN=/usr/bin/chromium \
     CHROMEDRIVER_PATH=/usr/bin/chromedriver \
-    HEADLESS=True
+    HEADLESS=True \
+    EXPERT360_HEADLESS=true \
+    EXPERT360_USE_PERSISTENT_PROFILE=false \
+    EXPERT360_BROWSER_START_ATTEMPTS=2
 
 # Install the Chromium and ChromeDriver versions currently available
 # from Debian Bookworm repositories. Debian keeps these compatible.
@@ -22,18 +25,25 @@ RUN apt-get update \
         libcairo2 \
         libcups2 \
         libdbus-1-3 \
+        libdrm2 \
+        libgbm1 \
         libgdk-pixbuf2.0-0 \
         libgtk-3-0 \
         libnspr4 \
         libnss3 \
         libpango-1.0-0 \
+        libu2f-udev \
+        libvulkan1 \
         libx11-6 \
         libxcomposite1 \
         libxdamage1 \
         libxext6 \
         libxfixes3 \
+        libxkbcommon0 \
         libxrandr2 \
         xdg-utils \
+        wget \
+        gnupg \
     && echo "Installed browser versions:" \
     && chromium --version \
     && chromedriver --version \

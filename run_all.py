@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import os
+import re
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -34,6 +35,63 @@ SCRAPERS = [
 ]
 
 SPREADSHEET_SCRIPT = "scrapers/spreadsheet_insert/insert_to_spreadsheet.py"
+
+def summarize_scraper_failure(name, stdout, stderr, returncode):
+    """
+    Build a useful failure summary: root exception first, then a limited tail.
+    Prefer meaningful Selenium/Chrome lines over native hex stack frames.
+    """
+    combined = f"{stdout or ''}\n{stderr or ''}"
+    non_empty = [ln.strip() for ln in combined.splitlines() if ln.strip()]
+    tail = non_empty[-100:]
+
+    priority_markers = [
+        "Expert360 fatal error",
+        "Expert360 WebDriver failure",
+        "WebDriverException",
+        "SessionNotCreatedException",
+        "session not created",
+        "Chrome failed to start",
+        "DevToolsActivePort",
+        "user data directory is already in use",
+        "Chrome not reachable",
+        "disconnected",
+        "invalid session id",
+        "cannot find Chrome binary",
+        "no chrome binary",
+        "missing shared library",
+        "No Chrome or Chromium executable was found",
+        "browser start failed",
+    ]
+
+    root = None
+    for line in non_empty:
+        lower = line.lower()
+        if any(marker.lower() in lower for marker in priority_markers):
+            root = line
+            break
+
+    if not root:
+        hex_frame = re.compile(r"^(?:#\d+\s+)?0x[0-9a-fA-F]+\b")
+        for line in reversed(non_empty):
+            if hex_frame.match(line):
+                continue
+            if line.lower() in {"<unknown>", "unknown"}:
+                continue
+            if sum(ch.isalpha() for ch in line) < 8:
+                continue
+            root = line
+            break
+
+    parts = []
+    if root:
+        parts.append(f"Root error: {root}")
+    if tail:
+        parts.append("Recent log tail:")
+        parts.extend(tail[-40:])
+    summary = "\n".join(parts) if parts else f"{name} failed with exit code {returncode}"
+    return summary
+
 
 def send_status_email(errors, summaries=None, spreadsheet_status=None):
     """Send an SMTP email notification detailing execution status."""
@@ -264,8 +322,13 @@ def main():
             scraper_summaries.append((name, "TIMEOUT", err_msg))
         except subprocess.CalledProcessError as e:
             print(f"❌ {name} Scraper failed with exit code {e.returncode}.")
-            output_log = (e.stdout or "") + "\n" + (e.stderr or "")
-            # Print output for Railway logs
+            output_log = summarize_scraper_failure(
+                name, e.stdout or "", e.stderr or "", e.returncode
+            )
+            # Print useful summary + recent lines for Railway logs
+            print(f"❌ {name} → EXIT_{e.returncode}")
+            for line in output_log.splitlines()[:25]:
+                print(f"  [{name}] {line}")
             if e.stdout:
                 for line in e.stdout.splitlines()[-20:]:
                     print(f"  [{name}] {line}")
@@ -273,7 +336,15 @@ def main():
                 for line in e.stderr.splitlines()[-10:]:
                     print(f"  [{name} STDERR] {line}")
             execution_errors.append((name, e.returncode, output_log))
-            scraper_summaries.append((name, f"EXIT_{e.returncode}", output_log[-500:]))
+            # Prefer root-error line in the compact summary table
+            root_line = ""
+            for line in output_log.splitlines():
+                if line.startswith("Root error:"):
+                    root_line = line
+                    break
+            scraper_summaries.append(
+                (name, f"EXIT_{e.returncode}", root_line or output_log[:500])
+            )
 
     # Print summary table before spreadsheet step
     print(f"\n{'='*50}")

@@ -60,6 +60,14 @@ OUTVISE_PASSWORD=your_outvise_password
 # OUTVISE_TARGET_URL=https://www.outvise.com/...
 CONSULTINGHEADS_EMAIL=your_consultingheads_email
 CONSULTINGHEADS_PASSWORD=your_consultingheads_password
+
+# Expert360 browser (local defaults). Railway image sets these automatically:
+# EXPERT360_HEADLESS=true
+# EXPERT360_USE_PERSISTENT_PROFILE=false
+# EXPERT360_BROWSER_START_ATTEMPTS=2
+EXPERT360_HEADLESS=false
+EXPERT360_USE_PERSISTENT_PROFILE=true
+EXPERT360_BROWSER_START_ATTEMPTS=2
 ```
 
 ---
@@ -77,4 +85,10 @@ CONSULTINGHEADS_PASSWORD=your_consultingheads_password
    ```
 2. **Create a project** in Railway and link it to your GitHub repository.
 3. **Configure Variables** in the Railway Dashboard using the keys listed in the `.env` section.
+   For Expert360 on Railway, ensure (or rely on Dockerfile defaults):
+   ```env
+   EXPERT360_HEADLESS=true
+   EXPERT360_USE_PERSISTENT_PROFILE=false
+   EXPERT360_BROWSER_START_ATTEMPTS=2
+   ```
 4. The service will automatically build via the [Dockerfile](Dockerfile) and run on the daily cron schedule defined in [railway.toml](railway.toml).
